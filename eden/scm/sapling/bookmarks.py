@@ -1272,13 +1272,31 @@ def _readremotenamesfrom(vfs, filename):
 
 
 def mainbookmark(repo):
-    """Get the "main" bookmark that represents the main commit history."""
+    """Get the primary bookmark that represents the main commit history.
+
+    Preference order:
+    1) First entry from `remotenames.selectivepulldefault` if configured.
+    2) "main" if it exists in the repo.
+    3) "master" if it exists in the repo.
+    4) Fallback to "main".
+    """
     names = repo.ui.configlist("remotenames", "selectivepulldefault")
-    if not names:
-        # Fallback
-        return "main"
-    else:
+    if names:
         return names[0]
+
+    # Try common defaults based on presence, to work with repos using
+    # either "main" or "master" as the default branch.
+    try:
+        if "main" in repo:
+            return "main"
+        if "master" in repo:
+            return "master"
+    except Exception:
+        # If name resolution fails for any reason, fall back below.
+        pass
+
+    # Final fallback if nothing is detectable locally.
+    return "main"
 
 
 def selectivepullinitbookmarknames(repo):
