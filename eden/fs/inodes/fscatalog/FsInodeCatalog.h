@@ -92,7 +92,7 @@ class FsFileContentStore : public FileContentStore {
       const folly::IOBuf& contents) override;
 
   /**
-   * Remove the overlay directory data associated with the passed InodeNumber.
+   * Remove the overlay file data associated with the passed InodeNumber.
    */
   void removeOverlayFile(InodeNumber inodeNumber) override;
 
@@ -194,7 +194,7 @@ class FsFileContentStore : public FileContentStore {
    * Validate an existing overlay's info file exists, is valid and contains the
    * correct version.
    */
-  void readExistingOverlay(int infoFD);
+  void validateExistingOverlay(int infoFD);
 
   void saveNextInodeNumber(InodeNumber nextInodeNumber);
 

@@ -46,8 +46,8 @@ use crate::error::ClonableError;
 use crate::indexedlogauxstore::AuxStore;
 use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
+use crate::lfs::LfsClient;
 use crate::lfs::LfsPointersEntry;
-use crate::lfs::LfsRemote;
 use crate::lfs::LfsStore;
 use crate::lfs::LfsStoreEntry;
 use crate::scmstore::FileAttributes;
@@ -181,7 +181,7 @@ impl FetchState {
     fn cache_entry(&mut self, entry: Entry) {
         self.files_to_cache.push((entry.node(), entry));
         if self.files_to_cache.len() >= 1_000 {
-            self.flush_to_cache();
+            self.flush_to_indexedlog();
         }
     }
 
@@ -512,11 +512,13 @@ impl FetchState {
                 }
                 lfsptr = Some(ptr);
             } else {
-                if indexedlog_cache.is_some() {
+                if let Some(cache) = &indexedlog_cache {
                     let mut e = Entry::new(hgid, entry.data()?, entry.metadata()?.clone());
+
                     // Pre-compress content here since we are being called in parallel (and
                     // compression is CPU intensive).
-                    e.compress_content()?;
+                    cache.maybe_compress_content(&mut e)?;
+
                     cache_entry = Some(e);
                 }
 
@@ -637,17 +639,28 @@ impl FetchState {
 
             fetching_keys.remove(&key);
             match res {
-                Ok((file, maybe_lfsptr, cache_entry)) => {
+                Ok((mut file, maybe_lfsptr, cache_entry)) => {
                     if let Some(lfsptr) = maybe_lfsptr {
                         found_pointers += 1;
                         self.found_pointer(key.clone(), lfsptr, false);
                     } else {
                         found += 1;
+
+                        if self.fctx.mode().ignore_result() {
+                            // If caller doesn't care about content, swap to a stub file to avoid
+                            // needlessly shuffling data around.
+                            file = StoreFile {
+                                // We obviously aren't Cas, but this is the simplest LazyFile variant to stub.
+                                content: Some(LazyFile::Cas(Blob::Bytes(minibytes::Bytes::new()))),
+                                aux_data: file.aux_data,
+                            }
+                        }
                     }
-                    self.found_attributes(key, file);
                     if let Some(cache_entry) = cache_entry {
                         self.cache_entry(cache_entry);
                     }
+
+                    self.found_attributes(key, file);
                 }
                 Err(err) => {
                     errors += 1;
@@ -671,6 +684,11 @@ impl FetchState {
                 }
             };
         }
+
+        // Flush buffered entries to indexedlog so they are visible to other readers sooner (i.e.
+        // don't wait until after LFS fetching is done). This appends to the indexedlog in-memory
+        // buffer, but will not necessarily sync the logs to disk.
+        self.flush_to_indexedlog();
 
         if found != 0 {
             debug!("    Found = {found}", found = found);
@@ -936,22 +954,17 @@ impl FetchState {
         self.metrics.cas_local_cache.update(&total_stats);
     }
 
-    pub(crate) fn fetch_lfs_remote(
-        &mut self,
-        store: &LfsRemote,
-        _local: Option<Arc<LfsStore>>,
-        cache: Option<Arc<LfsStore>>,
-    ) {
+    pub(crate) fn fetch_lfs_remote(&mut self, client: &LfsClient, buffer_in_memory: bool) {
+        let cache = &client.shared;
+
         let errors = &mut self.errors;
         let pending: HashSet<_> = self
             .lfs_pointers
             .iter()
             .map(|(key, (ptr, write))| {
                 if *write {
-                    if let Some(lfs_cache) = cache.as_ref() {
-                        if let Err(err) = lfs_cache.add_pointer(ptr.clone()) {
-                            errors.keyed_error(key.clone(), err);
-                        }
+                    if let Err(err) = cache.add_pointer(ptr.clone()) {
+                        errors.keyed_error(key.clone(), err);
                     }
                 }
                 (ptr.sha256(), ptr.size() as usize)
@@ -976,42 +989,125 @@ impl FetchState {
         let bar = ProgressBar::new_adhoc("LFS remote", pending.len() as u64, "files");
 
         // Fetch & write to local LFS stores
-        let top_level_error = store.batch_fetch(
-            self.fctx.clone(),
-            &pending,
-            |sha256, data| -> Result<()> {
-                bar.increase_position(1);
+        let top_level_error = if buffer_in_memory {
+            // Legacy path that streams LFS blob into memory.
+            client.remote.batch_fetch(
+                self.fctx.clone(),
+                &pending,
+                |sha256, data| -> Result<()> {
+                    bar.increase_position(1);
 
-                cache
-                    .as_ref()
-                    .expect("no lfs_cache present when handling cache LFS pointer")
-                    .add_blob(&sha256, data.clone())?;
+                    cache.add_blob(&sha256, data.clone())?;
 
-                // Unwrap is safe because the only place sha256 could come from is
-                // `pending` and all of its entries were put in `key_map`.
-                for (key, ptr) in key_map.get(&sha256).unwrap().iter() {
-                    let file = StoreFile {
-                        content: Some(LazyFile::Lfs(data.clone(), ptr.clone(), self.format)),
-                        ..Default::default()
+                    // Unwrap is safe because the only place sha256 could come from is
+                    // `pending` and all of its entries were put in `key_map`.
+                    for (key, ptr) in key_map.get(&sha256).unwrap().iter() {
+                        let file = StoreFile {
+                            content: Some(LazyFile::Lfs(
+                                data.clone().into(),
+                                ptr.clone(),
+                                self.format,
+                            )),
+                            ..Default::default()
+                        };
+
+                        self.found_attributes(key.clone(), file);
+                        self.lfs_pointers.remove(key);
+                    }
+
+                    Ok(())
+                },
+                |sha256, error| {
+                    if let Some(keys) = key_map.get(&sha256) {
+                        let error = ClonableError::new(NetworkError::wrap(error));
+                        for (key, _) in keys.iter() {
+                            keyed_errors.push(((*key).clone(), error.clone().into()));
+                        }
+                    } else {
+                        other_errors.push(anyhow!("invalid other lfs error: {:?}", error));
+                    }
+                },
+            )
+        } else {
+            // Put LFS cache into "consistent read" mode where cache insertions we made during
+            // `batch_fetch` are guaranteed to be readable from cache. This is so we can download,
+            // flush cache, and return mmap backed slices without worrying about the cache rotating
+            // out from underneath us.
+            let _consistent_reads = cache.with_consistent_reads();
+
+            let mut successful_hashes = Vec::with_capacity(pending.len());
+
+            // New path that streams LFS blob into indexedlog cache.
+            let res = client.batch_fetch(
+                self.fctx.clone(),
+                &pending,
+                |sha256| {
+                    bar.increase_position(1);
+                    successful_hashes.push(sha256);
+                },
+                |sha256, error| {
+                    if let Some(keys) = key_map.get(&sha256) {
+                        let error = ClonableError::new(NetworkError::wrap(error));
+                        for (key, _) in keys.iter() {
+                            keyed_errors.push(((*key).clone(), error.clone().into()));
+                        }
+                    } else {
+                        other_errors.push(anyhow!("invalid other lfs error: {:?}", error));
+                    }
+                },
+            );
+
+            if !self.fctx.mode().ignore_result() {
+                // Sync buffered chunks to indexedlog so the fetching below hits the mmap'd back data.
+                // The goal is to never hold an entire LFS file's content on the heap.
+                if let Err(err) = cache.flush() {
+                    self.errors.other_error(err);
+                }
+            }
+
+            // Unwrap is safe because the only place sha256 could come from is
+            // `pending` and all of its entries were put in `key_map`.
+            for hash in successful_hashes {
+                for (key, ptr) in key_map.get(&hash).unwrap().iter() {
+                    let file = if self.fctx.mode().ignore_result() {
+                        // Caller doesn't want data - send stub value.
+                        StoreFile {
+                            content: Some(LazyFile::Lfs(
+                                Bytes::new().into(),
+                                ptr.clone(),
+                                self.format,
+                            )),
+                            ..Default::default()
+                        }
+                    } else {
+                        let data = match cache.get_blob(&hash, ptr.size()) {
+                            Ok(Some(data)) => data,
+                            Ok(None) => {
+                                self.errors.keyed_error(
+                                    key.clone(),
+                                    anyhow!("LFS file missing from cache after download"),
+                                );
+                                continue;
+                            }
+                            Err(err) => {
+                                self.errors.keyed_error(key.clone(), err);
+                                continue;
+                            }
+                        };
+
+                        StoreFile {
+                            content: Some(LazyFile::Lfs(data, ptr.clone(), self.format)),
+                            ..Default::default()
+                        }
                     };
 
                     self.found_attributes(key.clone(), file);
                     self.lfs_pointers.remove(key);
                 }
+            }
 
-                Ok(())
-            },
-            |sha256, error| {
-                if let Some(keys) = key_map.get(&sha256) {
-                    let error = ClonableError::new(NetworkError::wrap(error));
-                    for (key, _) in keys.iter() {
-                        keyed_errors.push(((*key).clone(), error.clone().into()));
-                    }
-                } else {
-                    other_errors.push(anyhow!("invalid other lfs error: {:?}", error));
-                }
-            },
-        );
+            res
+        };
 
         if let Err(err) = top_level_error {
             let err = ClonableError::new(err);
@@ -1090,8 +1186,9 @@ impl FetchState {
 }
 
 impl FetchState {
-    // Flush pending files to file cache.
-    fn flush_to_cache(&mut self) {
+    // Flush pending files to indexedlog file cache. This appends to the indexedlog in-memory
+    // buffer, but will not necessarily sync the logs to disk.
+    fn flush_to_indexedlog(&mut self) {
         if let Some(file_cache) = &self.file_cache {
             if let Err(err) = file_cache.put_batch(std::mem::take(&mut self.files_to_cache)) {
                 self.errors.other_error(err);
@@ -1108,7 +1205,7 @@ impl FetchState {
 
 impl Drop for FetchState {
     fn drop(&mut self) {
-        self.flush_to_cache();
+        self.flush_to_indexedlog();
 
         self.common.results(std::mem::take(&mut self.errors), false);
     }

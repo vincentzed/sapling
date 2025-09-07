@@ -8,9 +8,15 @@
 
 import hashlib
 import os
+import sys
 from typing import Dict
 
 from .lib import testcase
+
+if sys.platform == "linux":
+    from errno import ENODATA as kENODATA
+else:
+    from errno import ENOATTR as kENODATA
 
 
 def getallxattrs(abspath: str) -> Dict[str, bytes]:
@@ -26,10 +32,20 @@ def sha1(value: bytes) -> bytes:
 
 @testcase.eden_repo_test
 class XattrTest(testcase.EdenRepoTest):
+    # There's currently no good way to calculate these on the fly. Precompute them for testing purposes.
+    expected_file_digest_hash = (
+        b"507c3561b91c17f73b215cc95b4456194c2fea86e484339c744065fdb7817ad9"
+    )
+    expected_dir_digest_hash = (
+        b"bd2ac888be110f12ab95a80ed850049c85f759113728271bcb98e11f00fb6bc8"
+    )
+
     def populate_repo(self) -> None:
         self.repo.write_file("hello", "hola\n")
         self.repo.write_file("subdir/file", "contents")
         self.repo.commit("Initial commit.")
+        if self.repo_type in ["hg", "filteredhg"]:
+            self.repo.push(".", "master", create=True)
 
     def test_get_sha1_xattr(self) -> None:
         filename = os.path.join(self.mount, "hello")
@@ -72,3 +88,27 @@ class XattrTest(testcase.EdenRepoTest):
             contents = f.read()
         expected_sha1 = sha1(contents)
         self.assertEqual(expected_sha1, xattr)
+
+    def test_get_digest_hash_xattr(self) -> None:
+        filename = os.path.join(self.mount, "hello")
+        dirname = os.path.join(self.mount, "subdir")
+
+        # The directory digest hash xattr is only supported on hg repos
+        if self.repo.get_type() not in ["hg", "filteredhg"]:
+            with self.assertRaises(OSError):
+                os.getxattr(dirname, "user.digesthash")
+            return
+
+        # For hg repos, we expect digest hashes to be available for all files and unmaterialized dirs
+        file_xattr = os.getxattr(filename, "user.digesthash")
+        dir_xattr = os.getxattr(dirname, "user.digesthash")
+        self.assertEqual(self.expected_file_digest_hash, file_xattr)
+        self.assertEqual(self.expected_dir_digest_hash, dir_xattr)
+
+        # and test what happens as we materialize the directory
+        with open(os.path.join(dirname, "new_file"), "w") as f:
+            f.write("foo")
+            f.flush()
+            with self.assertRaises(OSError) as cm:
+                self.assertEqual(kENODATA, os.getxattr(dirname, "user.digesthash"))
+            self.assertEqual(kENODATA, cm.exception.errno)

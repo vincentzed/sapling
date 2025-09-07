@@ -338,7 +338,7 @@ mod test {
         let master_book = BookmarkKey::new("master").unwrap();
         let bcs_id = repo
             .bookmarks
-            .get(ctx.clone(), &master_book)
+            .get(ctx.clone(), &master_book, bookmarks::Freshness::MostRecent)
             .await?
             .unwrap();
 

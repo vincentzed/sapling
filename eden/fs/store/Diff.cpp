@@ -77,7 +77,7 @@ void processRemovedSide(
     return;
   }
   auto childFuture =
-      diffRemovedTree(context, entryPath, scmEntry.second.getHash());
+      diffRemovedTree(context, entryPath, scmEntry.second.getObjectId());
   childFutures.add(std::move(entryPath), std::move(childFuture));
 }
 
@@ -102,7 +102,7 @@ void processAddedSide(
 
   if (wdEntry.second.isTree()) {
     auto childFuture =
-        diffAddedTree(context, entryPath, wdEntry.second.getHash());
+        diffAddedTree(context, entryPath, wdEntry.second.getObjectId());
     childFutures.add(std::move(entryPath), std::move(childFuture));
   }
 }
@@ -126,15 +126,15 @@ void processBothPresent(
       // tree-to-tree diff
       XDCHECK_EQ(scmEntry.second.getType(), wdEntry.second.getType());
       if (context->store->areObjectsKnownIdentical(
-              scmEntry.second.getHash(), wdEntry.second.getHash())) {
+              scmEntry.second.getObjectId(), wdEntry.second.getObjectId())) {
         return;
       }
       context->callback->modifiedPath(entryPath, wdEntry.second.getDtype());
       auto childFuture = diffTrees(
           context,
           entryPath,
-          scmEntry.second.getHash(),
-          wdEntry.second.getHash());
+          scmEntry.second.getObjectId(),
+          wdEntry.second.getObjectId());
       childFutures.add(std::move(entryPath), std::move(childFuture));
     } else {
       // tree-to-file
@@ -147,7 +147,7 @@ void processBothPresent(
       // Report everything in scmTree as REMOVED
       context->callback->removedPath(entryPath, scmEntry.second.getDtype());
       auto childFuture =
-          diffRemovedTree(context, entryPath, scmEntry.second.getHash());
+          diffRemovedTree(context, entryPath, scmEntry.second.getObjectId());
       childFutures.add(std::move(entryPath), std::move(childFuture));
     }
   } else {
@@ -162,14 +162,14 @@ void processBothPresent(
       // Report everything in wdEntry as ADDED
       context->callback->addedPath(entryPath, wdEntry.second.getDtype());
       auto childFuture =
-          diffAddedTree(context, entryPath, wdEntry.second.getHash());
+          diffAddedTree(context, entryPath, wdEntry.second.getObjectId());
       childFutures.add(std::move(entryPath), std::move(childFuture));
     } else {
       // file-to-file diff
-      // Even if blobs have different hashes, they could have the same contents.
+      // Even if blobs have different ids, they could have the same contents.
       // For example, if between the two revisions being compared, if a file was
       // changed and then later reverted. In that case, the contents would be
-      // the same but the blobs would have different hashes
+      // the same but the blobs would have different ids
       // If the types are different, then this entry is definitely modified
       if (filteredEntryType(
               scmEntry.second.getType(), windowsSymlinksEnabled) !=
@@ -182,8 +182,8 @@ void processBothPresent(
         auto compareEntryContents =
             context->store
                 ->areBlobsEqual(
-                    scmEntry.second.getHash(),
-                    wdEntry.second.getHash(),
+                    scmEntry.second.getObjectId(),
+                    wdEntry.second.getObjectId(),
                     context->getFetchContext())
                 .thenValue([entryPath = entryPath.copy(),
                             context,
@@ -314,8 +314,8 @@ FOLLY_NODISCARD ImmediateFuture<Unit> diffTrees(
 
             // Shortcut in the case where we're trying to diff the same tree.
             // This happens in the case in which the CLI (during eden doctor)
-            // calls getScmStatusBetweenRevisions() with the same hash in
-            // order to check if a commit hash is valid.
+            // calls getScmStatusBetweenRevisions() with the same id in
+            // order to check if a commit id is valid.
             if (scmTree.tree && wdTree.tree &&
                 context->store->areObjectsKnownIdentical(
                     scmTree.id, wdTree.id)) {
@@ -360,29 +360,29 @@ diffRoots(DiffContext* context, const RootId& root1, const RootId& root2) {
 ImmediateFuture<Unit> diffTrees(
     DiffContext* context,
     RelativePathPiece currentPath,
-    ObjectId scmHash,
-    ObjectId wdHash) {
+    ObjectId scmId,
+    ObjectId wdId) {
   return diffTrees(
       context,
       currentPath,
-      getTreeAndId(context, scmHash),
-      getTreeAndId(context, wdHash));
+      getTreeAndId(context, scmId),
+      getTreeAndId(context, wdId));
 }
 
 ImmediateFuture<Unit> diffAddedTree(
     DiffContext* context,
     RelativePathPiece currentPath,
-    ObjectId wdHash) {
+    ObjectId wdId) {
   return diffTrees(
-      context, currentPath, TreeAndId::null(), getTreeAndId(context, wdHash));
+      context, currentPath, TreeAndId::null(), getTreeAndId(context, wdId));
 }
 
 ImmediateFuture<Unit> diffRemovedTree(
     DiffContext* context,
     RelativePathPiece currentPath,
-    ObjectId scmHash) {
+    ObjectId scmId) {
   return diffTrees(
-      context, currentPath, getTreeAndId(context, scmHash), TreeAndId::null());
+      context, currentPath, getTreeAndId(context, scmId), TreeAndId::null());
 }
 
 } // namespace facebook::eden

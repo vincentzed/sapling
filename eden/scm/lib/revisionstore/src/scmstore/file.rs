@@ -65,8 +65,6 @@ use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
 use crate::lfs::LfsClient;
 use crate::lfs::LfsPointersEntry;
-use crate::lfs::LfsStore;
-use crate::lfs::lfs_from_hg_file_blob;
 use crate::scmstore::activitylogger::ActivityLogger;
 use crate::scmstore::fetch::FetchResults;
 use crate::scmstore::metrics::StoreLocation;
@@ -86,16 +84,14 @@ pub struct FileStore {
 
     // Local-only stores
     pub(crate) indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
-    pub(crate) lfs_local: Option<Arc<LfsStore>>,
 
     // Local non-lfs cache aka shared store
     pub(crate) indexedlog_cache: Option<Arc<IndexedLogHgIdDataStore>>,
 
-    // Local LFS cache aka shared store
-    pub(crate) lfs_cache: Option<Arc<LfsStore>>,
+    // LFS client, containing local store, local cache, and remote client.
+    pub(crate) lfs_client: Option<LfsClient>,
 
     // Remote stores
-    pub(crate) lfs_remote: Option<Arc<LfsClient>>,
     pub(crate) edenapi: Option<Arc<SaplingRemoteApiFileStore>>,
 
     // Aux Data Store
@@ -122,6 +118,9 @@ pub struct FileStore {
 
     // Temporary escape hatch to disable bounding of queue.
     pub(crate) unbounded_queue: bool,
+
+    // Temporary escape hatch to disable streaming of LFS data to caches.
+    pub(crate) lfs_buffer_in_memory: bool,
 }
 
 impl Drop for FileStore {
@@ -147,8 +146,12 @@ impl FileStore {
         }
         try_local_content!(id, self.indexedlog_cache, m.indexedlog.cache);
         try_local_content!(id, self.indexedlog_local, m.indexedlog.local);
-        try_local_content!(id, self.lfs_cache, m.lfs.cache);
-        try_local_content!(id, self.lfs_local, m.lfs.local);
+        try_local_content!(id, self.lfs_client.as_ref().map(|c| &c.shared), m.lfs.cache);
+        try_local_content!(
+            id,
+            self.lfs_client.as_ref().and_then(|c| c.local.as_ref()),
+            m.lfs.local
+        );
         Ok(None)
     }
 
@@ -288,16 +291,16 @@ impl FileStore {
 
         let aux_cache = self.aux_cache.clone();
         let indexedlog_local = self.indexedlog_local.clone();
-        let lfs_cache = self.lfs_cache.clone();
-        let lfs_local = self.lfs_local.clone();
         let edenapi = self.edenapi.clone();
         let cas_client = self.cas_client.clone();
-        let lfs_remote = self.lfs_remote.clone();
+        let lfs_client = self.lfs_client.clone();
         let activity_logger = self.activity_logger.clone();
         let format = self.format();
 
         let fetch_local = fctx.mode().contains(FetchMode::LOCAL);
         let fetch_remote = fctx.mode().contains(FetchMode::REMOTE);
+
+        let lfs_buffer_in_memory = self.lfs_buffer_in_memory;
 
         let process_func = move || {
             // Set bar as this thread's active bar. We don't do it when we create the bar
@@ -349,7 +352,7 @@ impl FileStore {
                         state.fetch_indexedlog(indexedlog_local, StoreLocation::Local);
                     }
 
-                    if let Some(ref lfs_local) = lfs_local {
+                    if let Some(lfs_local) = lfs_client.as_ref().and_then(|c| c.local.as_ref()) {
                         state.fetch_lfs(lfs_local, StoreLocation::Local);
                     }
                 }
@@ -369,7 +372,7 @@ impl FileStore {
                         state.fetch_indexedlog(indexedlog_cache, StoreLocation::Cache);
                     }
 
-                    if let Some(ref lfs_cache) = lfs_cache {
+                    if let Some(lfs_cache) = lfs_client.as_ref().map(|c| c.shared.as_ref()) {
                         state.fetch_lfs(lfs_cache, StoreLocation::Cache);
                     }
                 }
@@ -388,7 +391,7 @@ impl FileStore {
 
                 fctx.inc_local(fetched_since_last_time(&state));
 
-                if let Some(ref lfs_cache) = lfs_cache {
+                if let Some(lfs_cache) = lfs_client.as_ref().map(|c| c.shared.as_ref()) {
                     assert!(
                         format == SerializationFormat::Hg,
                         "LFS cannot be used with non-Hg serialization format"
@@ -396,7 +399,7 @@ impl FileStore {
                     state.fetch_lfs(lfs_cache, StoreLocation::Cache);
                 }
 
-                if let Some(ref lfs_local) = lfs_local {
+                if let Some(lfs_local) = lfs_client.as_ref().and_then(|c| c.local.as_ref()) {
                     assert!(
                         format == SerializationFormat::Hg,
                         "LFS cannot be used with non-Hg serialization format"
@@ -412,21 +415,17 @@ impl FileStore {
                     state.fetch_edenapi(
                         edenapi,
                         indexedlog_cache.clone(),
-                        lfs_cache.clone(),
+                        lfs_client.as_ref().map(|c| c.shared.clone()),
                         aux_cache.clone(),
                     );
                 }
 
-                if let Some(ref lfs_remote) = lfs_remote {
+                if let Some(ref lfs_client) = lfs_client {
                     assert!(
                         format == SerializationFormat::Hg,
                         "LFS cannot be used with non-Hg serialization format"
                     );
-                    state.fetch_lfs_remote(
-                        &lfs_remote.remote,
-                        lfs_local.clone(),
-                        lfs_cache.clone(),
-                    );
+                    state.fetch_lfs_remote(lfs_client, lfs_buffer_in_memory);
                 }
 
                 fctx.inc_remote(fetched_since_last_time(&state));
@@ -482,27 +481,32 @@ impl FileStore {
             self.format() == SerializationFormat::Hg,
             "LFS cannot be used with non-Hg serialization format"
         );
-        let lfs_local = self.lfs_local.as_ref().ok_or_else(|| {
-            anyhow!("trying to write LFS pointer but no local LfsStore is available")
-        })?;
+        let lfs_local = self
+            .lfs_client
+            .as_ref()
+            .and_then(|c| c.local.as_ref())
+            .ok_or_else(|| {
+                anyhow!("trying to write LFS pointer but no local LfsStore is available")
+            })?;
 
         let lfs_pointer = LfsPointersEntry::from_bytes(bytes, key.hgid)?;
         lfs_local.add_pointer(lfs_pointer)
     }
 
     fn write_lfs(&self, key: Key, bytes: Bytes) -> Result<()> {
-        let lfs_local = self.lfs_local.as_ref().ok_or_else(|| {
-            anyhow!("trying to write LFS file but no local LfsStore is available")
-        })?;
+        let lfs_local = self
+            .lfs_client
+            .as_ref()
+            .and_then(|c| c.local.as_ref())
+            .ok_or_else(|| {
+                anyhow!("trying to write LFS file but no local LfsStore is available")
+            })?;
         ensure!(
             self.format() == SerializationFormat::Hg,
             "LFS cannot be used with non-Hg serialization format"
         );
-        let (lfs_pointer, lfs_blob) = lfs_from_hg_file_blob(key.hgid, &bytes)?;
-        let sha256 = lfs_pointer.sha256();
 
-        lfs_local.add_blob(&sha256, lfs_blob)?;
-        lfs_local.add_pointer(lfs_pointer)?;
+        lfs_local.add_blob_and_pointer(key, bytes)?;
 
         Ok(())
     }
@@ -571,12 +575,8 @@ impl FileStore {
             indexedlog_cache.flush_log().map_err(&mut handle_error);
         }
 
-        if let Some(ref lfs_local) = self.lfs_local {
-            lfs_local.flush().map_err(&mut handle_error);
-        }
-
-        if let Some(ref lfs_cache) = self.lfs_cache {
-            lfs_cache.flush().map_err(&mut handle_error);
+        if let Some(lfs_client) = &self.lfs_client {
+            lfs_client.flush().map_err(&mut handle_error);
         }
 
         if let Some(ref aux_cache) = self.aux_cache {
@@ -611,13 +611,11 @@ impl FileStore {
             compute_aux_data: false,
 
             indexedlog_local: None,
-            lfs_local: None,
 
             indexedlog_cache: None,
-            lfs_cache: None,
 
             edenapi: None,
-            lfs_remote: None,
+            lfs_client: None,
             cas_client: None,
 
             metrics: FileStoreMetrics::new(),
@@ -633,6 +631,8 @@ impl FileStore {
             progress_bar: AggregatingProgressBar::new("", ""),
 
             unbounded_queue: false,
+
+            lfs_buffer_in_memory: false,
         }
     }
 
@@ -649,7 +649,7 @@ impl FileStore {
     pub fn with_shared_only(&self) -> Self {
         // this is infallible in ContentStore so panic if there are no shared/cache stores.
         assert!(
-            self.indexedlog_cache.is_some() || self.lfs_cache.is_some(),
+            self.indexedlog_cache.is_some() || self.lfs_client.is_some(),
             "cannot get shared_mutable, no shared / local cache stores available"
         );
 
@@ -661,13 +661,11 @@ impl FileStore {
             compute_aux_data: self.compute_aux_data,
 
             indexedlog_local: self.indexedlog_cache.clone(),
-            lfs_local: self.lfs_cache.clone(),
 
             indexedlog_cache: None,
-            lfs_cache: None,
 
             edenapi: None,
-            lfs_remote: None,
+            lfs_client: self.lfs_client.as_ref().map(|c| c.with_shared_only()),
             cas_client: None,
 
             metrics: self.metrics.clone(),
@@ -684,14 +682,16 @@ impl FileStore {
             progress_bar: self.progress_bar.clone(),
 
             unbounded_queue: self.unbounded_queue,
+
+            lfs_buffer_in_memory: self.lfs_buffer_in_memory,
         }
     }
 
     // Returns keys that weren't found locally.
     pub fn upload_lfs(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>> {
         self.metrics.write().api.hg_upload.call(keys.len());
-        if let Some(ref lfs_remote) = self.lfs_remote {
-            lfs_remote.upload(keys)
+        if let Some(ref lfs_client) = self.lfs_client {
+            lfs_client.upload(keys)
         } else {
             Ok(keys.to_vec())
         }
@@ -718,14 +718,14 @@ impl FileStore {
     pub fn metadata(&self, key: StoreKey) -> Result<StoreResult<ContentMetadata>> {
         self.metrics.write().api.contentdatastore_metadata.call(0);
 
-        if let Some(cache) = &self.lfs_cache {
+        if let Some(cache) = self.lfs_client.as_ref().map(|c| &c.shared) {
             let result = cache.metadata(key.clone())?;
             if matches!(result, StoreResult::Found(_)) {
                 return Ok(result);
             }
         }
 
-        if let Some(local) = &self.lfs_local {
+        if let Some(local) = self.lfs_client.as_ref().and_then(|c| c.local.as_ref()) {
             let result = local.metadata(key.clone())?;
             if matches!(result, StoreResult::Found(_)) {
                 return Ok(result);

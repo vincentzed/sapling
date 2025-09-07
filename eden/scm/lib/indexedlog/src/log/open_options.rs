@@ -126,6 +126,7 @@ pub struct OpenOptions {
     pub(crate) flush_filter: Option<FlushFilterFunc>,
     pub(crate) fsync: bool,
     pub(crate) auto_sync_threshold: Option<u64>,
+    pub(crate) btrfs_compression: bool,
 }
 
 pub type FlushFilterFunc =
@@ -245,6 +246,7 @@ impl OpenOptions {
             flush_filter: None,
             fsync: false,
             auto_sync_threshold: None,
+            btrfs_compression: false,
         }
     }
 
@@ -330,6 +332,14 @@ impl OpenOptions {
         self
     }
 
+    /// Enable btrfs aware mode.
+    ///
+    /// Used by `RotateLog` to take into account transparent btrfs compression.
+    pub fn btrfs_compression(mut self, btrfs: bool) -> Self {
+        self.btrfs_compression = btrfs;
+        self
+    }
+
     /// Construct [`Log`] at given directory. Incrementally build up specified
     /// indexes.
     ///
@@ -373,14 +383,7 @@ impl OpenOptions {
         let result: crate::Result<_> = (|| {
             let meta = LogMetadata::new_with_primary_len(PRIMARY_START_OFFSET);
             let mem_buf = Box::pin(Vec::new());
-            let (disk_buf, indexes) = Log::load_log_and_indexes(
-                &dir,
-                &meta,
-                &self.index_defs,
-                &mem_buf,
-                None,
-                self.fsync,
-            )?;
+            let (disk_buf, indexes) = Log::load_log_and_indexes(&dir, &meta, self, &mem_buf, None)?;
             let disk_folds = self.empty_folds();
             let all_folds = disk_folds.clone();
             Ok(Log {
@@ -391,10 +394,11 @@ impl OpenOptions {
                 indexes,
                 disk_folds,
                 all_folds,
-                index_corrupted: false,
+                index_out_of_sync: None,
                 open_options: self.clone(),
                 reader_lock: None,
                 change_detector: None,
+                prev_btrfs_metadata: None,
             })
         })();
 
@@ -447,14 +451,8 @@ impl OpenOptions {
         })?;
 
         let mem_buf = Box::pin(Vec::new());
-        let (disk_buf, indexes) = Log::load_log_and_indexes(
-            dir,
-            &meta,
-            &self.index_defs,
-            &mem_buf,
-            reuse_indexes,
-            self.fsync,
-        )?;
+        let (disk_buf, indexes) =
+            Log::load_log_and_indexes(dir, &meta, self, &mem_buf, reuse_indexes)?;
         let disk_folds = self.empty_folds();
         let all_folds = disk_folds.clone();
         let mut log = Log {
@@ -465,10 +463,11 @@ impl OpenOptions {
             indexes,
             disk_folds,
             all_folds,
-            index_corrupted: false,
+            index_out_of_sync: None,
             open_options: self.clone(),
             reader_lock,
             change_detector,
+            prev_btrfs_metadata: None,
         };
         log.update_indexes_for_on_disk_entries()?;
         log.update_and_flush_disk_folds()?;
@@ -497,7 +496,7 @@ impl OpenOptions {
 }
 
 impl IndexOutput {
-    pub(crate) fn into_cow(self, data: &[u8]) -> crate::Result<Cow<[u8]>> {
+    pub(crate) fn into_cow(self, data: &[u8]) -> crate::Result<Cow<'_, [u8]>> {
         Ok(match self {
             IndexOutput::Reference(range) => Cow::Borrowed(
                 data.get(range.start as usize..range.end as usize)

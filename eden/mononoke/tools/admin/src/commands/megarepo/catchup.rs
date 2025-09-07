@@ -70,7 +70,14 @@ pub async fn create_deletion_head_commits<'a>(
         .collect::<Vec<_>>();
 
     for (num, files) in file_chunks.into_iter().enumerate() {
-        let maybe_head_bookmark_val = repo.bookmarks().get(ctx.clone(), &head_bookmark).await?;
+        let maybe_head_bookmark_val = repo
+            .bookmarks()
+            .get(
+                ctx.clone(),
+                &head_bookmark,
+                bookmarks::Freshness::MostRecent,
+            )
+            .await?;
 
         let head_bookmark_val =
             maybe_head_bookmark_val.ok_or_else(|| anyhow!("{} not found", head_bookmark))?;
@@ -188,7 +195,10 @@ async fn find_files_that_need_to_be_deleted(
     commit_to_merge: ChangesetId,
     path_regex: Regex,
 ) -> Result<Vec<NonRootMPath>, Error> {
-    let maybe_head_bookmark_val = repo.bookmarks().get(ctx.clone(), head_bookmark).await?;
+    let maybe_head_bookmark_val = repo
+        .bookmarks()
+        .get(ctx.clone(), head_bookmark, bookmarks::Freshness::MostRecent)
+        .await?;
 
     let head_bookmark_val =
         maybe_head_bookmark_val.ok_or_else(|| anyhow!("{} not found", head_bookmark))?;

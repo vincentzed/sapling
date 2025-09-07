@@ -70,13 +70,14 @@ serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_derive = "1.0.185"
 slog = { package = "tracing_slog_compat", version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 sqlblob = { version = "0.1.0", path = "blobstore/sqlblob" }
-tokio = { version = "1.46.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
 toml = { version = "0.9.2", features = ["preserve_order"] }
 
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
 audio_streams = { git = "https://github.com/google/crosvm", rev = "7d2e877a2a0a772c199fe8b6b51aec7c1b166467" }
 base64urlsafedata = { git = "https://github.com/kanidm/webauthn-rs.git", rev = "d278c56adfa39a0723c79bdcd461644194bc5138" }
+c2pa = { git = "https://github.com/dhruvmongia/c2pa-rs", rev = "32fd8548e6780f229eee173e378d540a9b579d16" }
 cargo = { git = "https://github.com/rust-lang/cargo", rev = "f5b3a6ba899c2eb9285dd3769aa6d84179ee7f8b" }
 cbindgen = { git = "https://github.com/mozilla/cbindgen.git", rev = "cf94b56ef35d91f8420e8f89fee70074d39d068d" }
 cxx = { package = "cxx", git = "https://github.com/facebookexperimental/cxx.git", rev = "43f8f85eb1b9d99f10f7228ab679997c484ade69" }
@@ -108,6 +109,12 @@ tokenizers-21 = { package = "tokenizers", git = "https://github.com/huggingface/
 uefisettings = { git = "https://github.com/linuxboot/uefisettings", rev = "c0599ade83438ae4f050f6c2c169ee946e847f58" }
 vm-allocator = { git = "https://github.com/rust-vmm/vm-allocator", rev = "5fb545cc6e41fdc9f27d48d97ed26274a35bc6c6" }
 warp = { git = "https://github.com/jdthomas/warp.git", rev = "c794232d182abaa3add8184e7d661e084cc516c5" }
+zenoh = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
+zenoh-ext = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
+zenoh-protocol = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
+zenoh-runtime = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
+zenoh-util = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
+zenohd = { git = "https://github.com/nitinsingh-meta/zenoh", rev = "9b525dceb27582395da945c5af0c46a5d926f078" }
 
 [workspace]
 members = [

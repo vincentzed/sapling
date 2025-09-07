@@ -1094,7 +1094,7 @@ pub async fn find_bookmark_and_value<R: MononokeRepo>(
     let cs_id = repo
         .repo()
         .bookmarks()
-        .get(ctx.clone(), &bookmark)
+        .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
         .map_err(MegarepoError::internal)
         .await?
         .ok_or_else(|| MegarepoError::request(anyhow!("bookmark {} not found", bookmark)))?;

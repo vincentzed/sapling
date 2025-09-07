@@ -125,6 +125,8 @@ async fn init_repo(ctx: &CoreContext) -> Result<(Repo, HashMap<&'static str, Cha
             .add_file("test/partial/match/file2", "one\ntwo\nfour\n")
             // Non-match due to content being too different
             .add_file("test/another/file2", "one\ntwo\nthree\nfour\nfive\nsix\n")
+            // Modified an existing file
+            .add_file("test/file2", "one\ntwo\n")
             .set_author_date(DateTime::from_timestamp(1000, 0)?)
             .commit()
             .await?,

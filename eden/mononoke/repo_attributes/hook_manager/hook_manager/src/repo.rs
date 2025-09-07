@@ -25,6 +25,7 @@ use bookmarks::BookmarkPrefix;
 use bookmarks::Bookmarks;
 use bytes::Bytes;
 use changeset_info::ChangesetInfo;
+use commit_graph::CommitGraph;
 use context::CoreContext;
 use fsnodes::RootFsnodeId;
 use futures::future;
@@ -33,6 +34,7 @@ use manifest::Diff;
 use manifest::Entry;
 use manifest::ManifestOps;
 use metaconfig_types::RepoConfig;
+use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::ContentMetadataV2;
@@ -80,6 +82,9 @@ pub struct HookRepo {
 
     #[facet]
     pub repo_cross_repo: RepoCrossRepo,
+
+    #[facet]
+    pub commit_graph: CommitGraph,
 }
 
 impl HookRepo {
@@ -91,6 +96,14 @@ impl HookRepo {
         filestore::get_metadata(&self.repo_blobstore, ctx, &id.into())
             .await?
             .ok_or_else(|| anyhow!("Content with id '{id}' not found"))
+    }
+
+    pub async fn get_bonsai_changeset<'a>(
+        &'a self,
+        ctx: &'a CoreContext,
+        id: ChangesetId,
+    ) -> Result<BonsaiChangeset> {
+        Ok(id.load(ctx, &self.repo_blobstore).await?)
     }
 
     pub async fn get_file_text<'a>(
@@ -132,7 +145,7 @@ impl HookRepo {
     ) -> Result<HashMap<NonRootMPath, PathContent>> {
         let changeset_id = self
             .bookmarks
-            .get(ctx.clone(), &bookmark)
+            .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
             .await
             .with_context(|| format!("Error fetching bookmark: {}", bookmark))?
             .ok_or_else(|| anyhow!("Bookmark {} does not exist", bookmark))?;
@@ -233,7 +246,7 @@ impl HookRepo {
     ) -> Result<HashMap<NonRootMPath, ChangesetInfo>> {
         let changeset_id = self
             .bookmarks
-            .get(ctx.clone(), &bookmark)
+            .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
             .await
             .with_context(|| format!("Error fetching bookmark: {}", bookmark))?
             .ok_or_else(|| anyhow!("Bookmark {} does not exist", bookmark))?;
@@ -312,7 +325,7 @@ impl HookRepo {
     ) -> Result<BookmarkState> {
         let maybe_bookmark_val = self
             .bookmarks
-            .get(ctx.clone(), bookmark)
+            .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
             .await
             .with_context(|| format!("Error fetching bookmark: {}", bookmark))?;
         if let Some(cs_id) = maybe_bookmark_val {

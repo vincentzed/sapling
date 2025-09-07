@@ -69,7 +69,11 @@ pub async fn run(ctx: &CoreContext, app: MononokeApp, args: CheckPrereqsArgs) ->
     let source_cs_id = if let Some(bookmark) = args.source_changeset.strip_prefix("bm=") {
         source_repo
             .bookmarks()
-            .get(ctx.clone(), &BookmarkKey::new(bookmark)?)
+            .get(
+                ctx.clone(),
+                &BookmarkKey::new(bookmark)?,
+                bookmarks::Freshness::MostRecent,
+            )
             .await
             .with_context(|| format!("Failed to resolve bookmark '{}'", bookmark))?
             .ok_or_else(|| anyhow!("Couldn't find bookmark: {}", bookmark))
@@ -86,7 +90,11 @@ pub async fn run(ctx: &CoreContext, app: MononokeApp, args: CheckPrereqsArgs) ->
     let target_cs_id = if let Some(bookmark) = args.target_changeset.strip_prefix("bm=") {
         target_repo
             .bookmarks()
-            .get(ctx.clone(), &BookmarkKey::new(bookmark)?)
+            .get(
+                ctx.clone(),
+                &BookmarkKey::new(bookmark)?,
+                bookmarks::Freshness::MostRecent,
+            )
             .await
             .with_context(|| format!("Failed to resolve bookmark '{}'", bookmark))?
             .ok_or_else(|| anyhow!("Couldn't find bookmark: {}", bookmark))

@@ -512,7 +512,11 @@ mod tests {
     ) -> Result<(RootGitDeltaManifestV2Id, ChangesetId)> {
         let cs_id = repo
             .bookmarks()
-            .get(ctx.clone(), &BookmarkKey::from_str("master")?)
+            .get(
+                ctx.clone(),
+                &BookmarkKey::from_str("master")?,
+                bookmarks::Freshness::MostRecent,
+            )
             .await?
             .ok_or_else(|| format_err!("no master"))?;
         // Validate that the derivation of the GitDeltaManifestV2 for the head commit succeeds

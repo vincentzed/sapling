@@ -7,7 +7,9 @@
 
 #![allow(unexpected_cfgs)]
 
+#[cfg(fbcode_build)]
 use bytes::Buf;
+pub use minibytes::Bytes;
 use types::Blake3;
 use types::Sha1;
 
@@ -47,7 +49,7 @@ impl Blob {
     pub fn into_iobuf(self) -> iobuf::IOBufShared {
         match self {
             // safety: `minibytes::Bytes`'s deref as `[u8]` is valid when `bytes` is alive.
-            Self::Bytes(bytes) => unsafe { iobuf::IOBufShared::from_owner(bytes) },
+            Self::Bytes(bytes) => iobuf_from_bytes(bytes),
             Self::IOBuf(buf) => buf,
         }
     }
@@ -124,6 +126,87 @@ impl Blob {
     }
 }
 
+#[cfg(fbcode_build)]
+fn iobuf_from_bytes(bytes: minibytes::Bytes) -> iobuf::IOBufShared {
+    unsafe { iobuf::IOBufShared::from_owner(bytes) }
+}
+
+impl PartialEq for Blob {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Bytes(l), Self::Bytes(r)) => l == r,
+            #[cfg(fbcode_build)]
+            (Self::IOBuf(l), Self::IOBuf(r)) => l == r,
+            #[cfg(fbcode_build)]
+            (Self::IOBuf(buf), Self::Bytes(bytes)) => {
+                buf.len() == bytes.len() && buf == &iobuf_from_bytes(bytes.clone())
+            }
+            #[cfg(fbcode_build)]
+            (Self::Bytes(bytes), Self::IOBuf(buf)) => {
+                buf.len() == bytes.len() && buf == &iobuf_from_bytes(bytes.clone())
+            }
+        }
+    }
+}
+
+impl From<minibytes::Bytes> for Blob {
+    fn from(value: minibytes::Bytes) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+/// Builds a Blob, using IOBuf to chain chunks when possible.
+pub enum Builder {
+    // capacity
+    Empty(usize),
+    Bytes(Vec<u8>),
+    #[cfg(fbcode_build)]
+    IOBuf(iobuf::IOBufShared),
+}
+
+impl Builder {
+    pub fn new() -> Self {
+        Self::with_capacity(0)
+    }
+
+    pub fn with_capacity(size: usize) -> Self {
+        Self::Empty(size)
+    }
+
+    pub fn append(&mut self, chunk: Bytes) {
+        match self {
+            Builder::Empty(size) => {
+                #[cfg(fbcode_build)]
+                {
+                    // Using IOBuf - ignore size for pre-allocation.
+                    let _ = size;
+                    *self = Self::IOBuf(iobuf_from_bytes(chunk));
+                }
+
+                #[cfg(not(fbcode_build))]
+                {
+                    // Not using IOBuf - pre-allocate with given size.
+                    let mut data = Vec::with_capacity(*size);
+                    data.extend_from_slice(chunk.as_ref());
+                    *self = Self::Bytes(data);
+                }
+            }
+            Builder::Bytes(data) => data.extend_from_slice(chunk.as_ref()),
+            #[cfg(fbcode_build)]
+            Builder::IOBuf(iobuf) => iobuf.append_to_end(iobuf_from_bytes(chunk)),
+        }
+    }
+
+    pub fn into_blob(self) -> Blob {
+        match self {
+            Builder::Empty(_) => Blob::Bytes(Bytes::new()),
+            Builder::Bytes(data) => Blob::Bytes(data.into()),
+            #[cfg(fbcode_build)]
+            Builder::IOBuf(iobuf) => Blob::IOBuf(iobuf),
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -141,5 +224,44 @@ mod test {
 
         assert_eq!(blob1.sha1(), blob2.sha1());
         assert_eq!(blob1.blake3(), blob2.blake3());
+    }
+
+    #[test]
+    fn test_blob_eq() {
+        let a = Blob::Bytes(minibytes::Bytes::from("hello world!"));
+        let b = Blob::Bytes(minibytes::Bytes::from("hello world!"));
+        assert_eq!(a, b);
+
+        let a = Blob::Bytes(minibytes::Bytes::from("hello world!"));
+        let b = Blob::Bytes(minibytes::Bytes::from("oops"));
+        assert!(a != b);
+
+        #[cfg(fbcode_build)]
+        {
+            let a = Blob::Bytes(minibytes::Bytes::from("hello world!"));
+            let b = Blob::IOBuf(iobuf::IOBufShared::from("hello world!"));
+            assert_eq!(a, b);
+            assert_eq!(b, a);
+
+            let a = Blob::Bytes(minibytes::Bytes::from("hello world!"));
+            let b = Blob::IOBuf(iobuf::IOBufShared::from("oops"));
+            assert!(a != b);
+            assert!(b != a);
+        }
+    }
+
+    #[test]
+    fn test_iobuf_builder() {
+        let b = Builder::new();
+        assert_eq!(b.into_blob().len(), 0);
+
+        let mut b = Builder::new();
+        b.append(Bytes::from_static(b"hello"));
+        assert_eq!(b.into_blob().into_bytes(), b"hello");
+
+        let mut b = Builder::new();
+        b.append(Bytes::from_static(b"hello"));
+        b.append(Bytes::from_static(b" there"));
+        assert_eq!(b.into_blob().into_bytes(), b"hello there");
     }
 }

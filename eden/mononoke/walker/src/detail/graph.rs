@@ -1052,7 +1052,7 @@ impl Node {
         ctx: CoreContext,
         repo: Repo,
         node_data: &NodeData,
-    ) -> BoxFuture<Result<(), HashValidationError>> {
+    ) -> BoxFuture<'_, Result<(), HashValidationError>> {
         match (&self, node_data) {
             (Node::HgFileEnvelope(hg_filenode_id), NodeData::HgFileEnvelope(envelope)) => {
                 let hg_filenode_id = hg_filenode_id.clone();
@@ -1196,6 +1196,7 @@ mod tests {
         let grandfathered: HashSet<DerivableType> = HashSet::from_iter(vec![
             DerivableType::GitCommits,
             DerivableType::GitDeltaManifestsV2,
+            DerivableType::GitDeltaManifestsV3,
             DerivableType::TestManifests,
             DerivableType::TestShardedManifests,
             DerivableType::BssmV3,

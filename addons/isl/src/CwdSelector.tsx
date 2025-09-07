@@ -38,7 +38,7 @@ import {T, t} from './i18n';
 import {writeAtom} from './jotaiUtils';
 import platform from './platform';
 import {serverCwd} from './repositoryData';
-import {submodulesByRoot, repositoryInfo} from './serverAPIState';
+import {repositoryInfo, submodulesByRoot} from './serverAPIState';
 import {registerCleanup, registerDisposable} from './utils';
 
 /**
@@ -55,13 +55,13 @@ export function relativePath(root: AbsolutePath, path: AbsolutePath) {
 
 /**
  * Simple version of path.join()
- * Expect an absolute root path and a relative path whose separators are '/'
+ * Expect an absolute root path and a relative path
  * e.g.
  * joinPaths('/home', 'user') -> '/home/user'
  * joinPaths('/home/', 'user/.config') -> '/home/user/.config'
  */
-export function joinPaths(root: AbsolutePath, path: CwdRelativePath): AbsolutePath {
-  return root.endsWith('/') ? root + path : root + '/' + path;
+export function joinPaths(root: AbsolutePath, path: CwdRelativePath, sep = '/'): AbsolutePath {
+  return root.endsWith(sep) ? root + path : root + sep + path;
 }
 
 /**
@@ -96,7 +96,7 @@ function getMainSelectorLabel(
   if (repoRelativeCwd === '') {
     return repoBasename;
   }
-  return joinPaths(repoBasename, repoRelativeCwd);
+  return joinPaths(repoBasename, repoRelativeCwd, sep);
 }
 
 export const availableCwds = atom<Array<CwdInfo>>([]);

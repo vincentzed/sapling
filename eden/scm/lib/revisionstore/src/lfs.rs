@@ -13,7 +13,6 @@ use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::iter;
-use std::mem;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::path::Path;
@@ -21,6 +20,7 @@ use std::path::PathBuf;
 use std::str;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -31,10 +31,10 @@ use anyhow::Error;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use anyhow::ensure;
 use anyhow::format_err;
 use async_runtime::block_on;
 use async_runtime::stream_to_iter;
+use blob::Blob;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use configmodel::convert::ByteCount;
@@ -61,7 +61,7 @@ use indexedlog::DefaultOpenOptions;
 use indexedlog::Repair;
 use indexedlog::log::IndexOutput;
 use indexedlog::rotate;
-use itertools::Itertools;
+use indexedlog::rotate::ConsistentReadGuard;
 use lfs_protocol::ObjectAction;
 use lfs_protocol::ObjectStatus;
 use lfs_protocol::Operation;
@@ -71,13 +71,14 @@ use lfs_protocol::ResponseBatch;
 use lfs_protocol::Sha256 as LfsSha256;
 use mincode::deserialize;
 use mincode::serialize;
+use mincode::serialize_into;
 use minibytes::Bytes;
-use parking_lot::Mutex;
 use rand::Rng;
 use rand::thread_rng;
 use redacted::is_redacted;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
+use sha2::Digest;
 use storemodel::SerializationFormat;
 use tokio::task::spawn_blocking;
 use tokio::time::sleep;
@@ -97,20 +98,11 @@ use util::path::create_shared_dir;
 use util::path::remove_file;
 
 use crate::datastore::ContentMetadata;
-use crate::datastore::Delta;
-use crate::datastore::HgIdDataStore;
-use crate::datastore::HgIdMutableDeltaStore;
-use crate::datastore::Metadata;
-use crate::datastore::RemoteDataStore;
 use crate::datastore::StoreResult;
 use crate::error::FetchError;
 use crate::error::TransferError;
-use crate::historystore::HgIdMutableHistoryStore;
-use crate::historystore::RemoteHistoryStore;
 use crate::indexedlogutil::Store;
 use crate::indexedlogutil::StoreOpenOptions;
-use crate::localstore::LocalStore;
-use crate::remotestore::HgIdRemoteStore;
 use crate::types::ContentHash;
 use crate::types::StoreKey;
 use crate::util::get_lfs_blobs_path;
@@ -120,13 +112,15 @@ use crate::util::get_lfs_pointers_path;
 /// The `LfsPointersStore` holds the mapping between a `HgId` and the content hash (sha256) of the LFS blob.
 struct LfsPointersStore(Store);
 
+#[derive(Clone)]
 pub struct LfsIndexedLogBlobsStore {
-    inner: Store,
+    inner: Arc<Store>,
     chunk_size: usize,
 }
 
 /// The `LfsBlobsStore` holds the actual blobs. Lookup is done via the content hash (sha256) of the
 /// blob.
+#[derive(Clone)]
 pub enum LfsBlobsStore {
     /// Blobs are stored on-disk and will stay on it until garbage collected.
     Loose(PathBuf, bool),
@@ -135,16 +129,16 @@ pub enum LfsBlobsStore {
     IndexedLog(LfsIndexedLogBlobsStore),
 
     /// Allow blobs to be searched in both stores. Writes will only be done to the first one.
-    Union(Box<LfsBlobsStore>, Box<LfsBlobsStore>),
+    Union(Arc<LfsBlobsStore>, Arc<LfsBlobsStore>),
 }
 
 pub struct HttpLfsRemote {
     url: Url,
     client: Arc<HttpClient>,
     concurrent_fetches: usize,
-    download_chunk_size: Option<NonZeroU64>,
-    max_batch_size: usize,
+    download_chunk_size: NonZeroU64,
     http_options: Arc<HttpOptions>,
+    buf_pool: LimitedBufferPool,
 }
 
 struct HttpOptions {
@@ -162,12 +156,12 @@ pub enum LfsRemote {
     File(LfsBlobsStore),
 }
 
+#[derive(Clone)]
 pub struct LfsClient {
-    local: Option<Arc<LfsStore>>,
-    shared: Arc<LfsStore>,
-    pub(crate) remote: LfsRemote,
+    pub(crate) local: Option<Arc<LfsStore>>,
+    pub(crate) shared: Arc<LfsStore>,
+    pub(crate) remote: Arc<LfsRemote>,
     move_after_upload: bool,
-    ignore_prefetch_errors: bool,
 }
 
 /// Main LFS store to be used within the `ContentStore`.
@@ -286,11 +280,6 @@ impl LfsPointersStore {
         Self::get_from_slice(buf).map(Some)
     }
 
-    /// Find the pointer corresponding to the passed in `Key`.
-    fn get(&self, key: &StoreKey) -> Result<Option<LfsPointersEntry>> {
-        self.entry(key)
-    }
-
     /// Find the pointer corresponding to the passed in `HgId`.
     fn get_by_hgid(&self, hgid: &HgId) -> Result<Option<LfsPointersEntry>> {
         let log = self.0.read();
@@ -332,7 +321,7 @@ impl LfsIndexedLogBlobsStore {
         StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(20_000_000_000 / 4)
-            .auto_sync_threshold(50 * 1024 * 1024)
+            .auto_sync_threshold(250 * 1024 * 1024)
             .load_specific_config(config, "lfs")
             .index("sha256", |_| {
                 vec![IndexOutput::Reference(0..Sha256::len() as u64)]
@@ -355,12 +344,12 @@ impl LfsIndexedLogBlobsStore {
     pub fn rotated(path: &Path, config: &dyn Config) -> Result<Self> {
         let path = get_lfs_blobs_path(path)?;
         Ok(Self {
-            inner: LfsIndexedLogBlobsStore::open_options(config)?.rotated(path)?,
+            inner: Arc::new(LfsIndexedLogBlobsStore::open_options(config)?.rotated(path)?),
             chunk_size: LfsIndexedLogBlobsStore::chunk_size(config)?,
         })
     }
 
-    pub fn get(&self, hash: &Sha256, total_size: u64) -> Result<Option<Bytes>> {
+    pub fn get(&self, hash: &Sha256, total_size: u64) -> Result<Option<Blob>> {
         let log = self.inner.read();
         let chunks_iter = log.lookup(0, hash)?.map(|data| {
             let data: Bytes = log.slice_to_bytes(data?);
@@ -389,7 +378,7 @@ impl LfsIndexedLogBlobsStore {
         // unwrap safety: chunks isn't empty.
         let size = chunks.last().unwrap().1.range.end;
 
-        let mut res = Vec::with_capacity(size);
+        let mut blob_builder = blob::Builder::with_capacity(size);
 
         let mut next_start = 0;
         for (_, entry) in chunks.into_iter() {
@@ -415,10 +404,11 @@ impl LfsIndexedLogBlobsStore {
 
             next_start = entry.range.end;
 
-            res.extend_from_slice(entry.data.slice(range_in_data).as_ref());
+            blob_builder.append(entry.data.slice(range_in_data));
         }
 
-        let data: Bytes = res.into();
+        let data = blob_builder.into_blob();
+
         // Skip SHA256 hash check on reading. Data integrity is checked by indexedlog xxhash and
         // length. The SHA256 check can be slow (~90% of data reading time!).
         if data.len() as u64 == total_size || is_redacted(&data) {
@@ -437,7 +427,7 @@ impl LfsIndexedLogBlobsStore {
     fn chunk(mut data: Bytes, chunk_size: usize) -> impl Iterator<Item = (Range<usize>, Bytes)> {
         let mut start = 0;
         iter::from_fn(move || {
-            if data.len() == 0 {
+            if data.is_empty() {
                 None
             } else {
                 let size = min(chunk_size, data.len());
@@ -486,10 +476,10 @@ impl LfsBlobsStore {
     /// Store the blobs in a rotated `IndexedLog`, but still allow reading blobs in their loose
     /// format.
     pub fn rotated_or_loose_objects(path: &Path, config: &dyn Config) -> Result<Self> {
-        let indexedlog = Box::new(LfsBlobsStore::IndexedLog(LfsIndexedLogBlobsStore::rotated(
+        let indexedlog = Arc::new(LfsBlobsStore::IndexedLog(LfsIndexedLogBlobsStore::rotated(
             path, config,
         )?));
-        let loose = Box::new(LfsBlobsStore::Loose(get_lfs_objects_path(path)?, false));
+        let loose = Arc::new(LfsBlobsStore::Loose(get_lfs_objects_path(path)?, false));
 
         Ok(LfsBlobsStore::union(indexedlog, loose))
     }
@@ -500,7 +490,7 @@ impl LfsBlobsStore {
         LfsBlobsStore::Loose(path, false)
     }
 
-    fn union(first: Box<LfsBlobsStore>, second: Box<LfsBlobsStore>) -> Self {
+    fn union(first: Arc<LfsBlobsStore>, second: Arc<LfsBlobsStore>) -> Self {
         LfsBlobsStore::Union(first, second)
     }
 
@@ -518,7 +508,7 @@ impl LfsBlobsStore {
     /// Read the blob matching the content hash.
     ///
     /// Blob hash should be validated by the underlying store.
-    pub fn get(&self, hash: &Sha256, size: u64) -> Result<Option<Bytes>> {
+    pub fn get(&self, hash: &Sha256, size: u64) -> Result<Option<Blob>> {
         let blob = match self {
             LfsBlobsStore::Loose(path, _) => {
                 let path = LfsBlobsStore::path(path, hash);
@@ -535,8 +525,10 @@ impl LfsBlobsStore {
 
                 let mut buf = Vec::new();
                 file.read_to_end(&mut buf)?;
-                let blob = Bytes::from(buf);
-                if &ContentHash::sha256(&blob).unwrap_sha256() == hash || is_redacted(&blob) {
+                let bytes = Bytes::from(buf);
+                let apparent_hash = ContentHash::sha256(&bytes).unwrap_sha256();
+                let blob = Blob::from(bytes);
+                if &apparent_hash == hash || is_redacted(&blob) {
                     Some(blob)
                 } else {
                     None
@@ -569,16 +561,7 @@ impl LfsBlobsStore {
     pub fn add(&self, hash: &Sha256, blob: Bytes) -> Result<()> {
         match self {
             LfsBlobsStore::Loose(path, is_local) => {
-                let path = LfsBlobsStore::path(path, hash);
-                let parent_path = path.parent().unwrap();
-
-                if *is_local {
-                    create_dir(parent_path)?;
-                } else {
-                    create_shared_dir(parent_path)?;
-                }
-
-                let mut file = File::create(path)?;
+                let mut file = create_loose_file(path, hash, *is_local)?;
                 file.write_all(&blob)?;
 
                 if *is_local {
@@ -616,9 +599,211 @@ impl LfsBlobsStore {
     }
 }
 
+fn create_loose_file(path: &Path, hash: &Sha256, is_local: bool) -> Result<File> {
+    let path = LfsBlobsStore::path(path, hash);
+    let parent_path = path.parent().unwrap();
+
+    if is_local {
+        create_dir(parent_path)?;
+    } else {
+        create_shared_dir(parent_path)?;
+    }
+
+    Ok(File::create(path)?)
+}
+
+/// Streaming LFS chunk inserter to insert into LFS blob store without holding the entire blob in
+/// memory.
+struct StreamingInserter {
+    expected_hash: Sha256,
+    got_hash: sha2::Sha256,
+    size: u64,
+    written_so_far: u64,
+    redacted: bool,
+    state: StreamingState,
+}
+
+enum StreamingState {
+    // Store, reusable buffer, written so far
+    Log(LfsIndexedLogBlobsStore, Vec<u8>, usize),
+    // File to append chunks to
+    File(File),
+    // Store in memory
+    Memory(Vec<u8>),
+}
+
+impl StreamingState {
+    fn write_chunk(&mut self, chunk: Bytes, hash: Sha256, force: bool) -> Result<Option<Vec<u8>>> {
+        match self {
+            StreamingState::Log(store, buf, len) => {
+                let mut took_chunk = false;
+
+                match chunk.take_vec() {
+                    Ok(chunk_vec) => {
+                        // If buf is empty and chunk_vec is bigger, just use it. The main goal here
+                        // is to optimize allocations when a single network chunk satisfies
+                        // store.chunk_size (i.e. we don't need to allocate buf at all).
+                        if buf.is_empty() && buf.capacity() < chunk_vec.len() {
+                            *buf = chunk_vec;
+                            took_chunk = true;
+                        } else {
+                            buf.extend_from_slice(&chunk_vec);
+                        }
+                    }
+                    Err(chunk) => {
+                        buf.extend_from_slice(chunk.as_ref());
+                    }
+                }
+
+                // Accumulate chunks until we get to the desired storage chunk size.
+                if force || buf.len() >= store.chunk_size {
+                    let data_len = buf.len();
+                    let entry = LfsIndexedLogBlobsEntry {
+                        sha256: hash,
+                        range: *len..*len + data_len,
+                        // Convert our reusable buf into Bytes, temporarily.
+                        data: std::mem::take(buf).into(),
+                    };
+                    store
+                        .inner
+                        .append_direct(|buf| Ok(serialize_into(buf, &entry)?))?;
+                    *len += data_len;
+
+                    if took_chunk {
+                        // If we took the vec out of `chunk`, return it back to caller so it can be reused.
+                        return Ok(entry.data.take_vec().ok());
+                    } else {
+                        // Now that we are done serializing, recover our buf for future buffering.
+                        *buf = entry.data.into_vec();
+                        buf.clear();
+                    }
+                }
+                Ok(None)
+            }
+            StreamingState::File(file) => {
+                file.write_all(&chunk)?;
+                Ok(chunk.take_vec().ok())
+            }
+            StreamingState::Memory(buf) => {
+                buf.extend_from_slice(chunk.as_ref());
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl StreamingInserter {
+    pub(crate) fn new(store: &LfsBlobsStore, hash: Sha256, size: u64) -> Result<Self> {
+        match &store {
+            LfsBlobsStore::Loose(path, local) => Ok(Self {
+                expected_hash: hash,
+                got_hash: sha2::Sha256::new(),
+                size,
+                written_so_far: 0,
+                redacted: false,
+                state: StreamingState::File(create_loose_file(path, &hash, *local)?),
+            }),
+            LfsBlobsStore::IndexedLog(store) => Ok(Self {
+                expected_hash: hash,
+                got_hash: sha2::Sha256::new(),
+                size,
+                written_so_far: 0,
+                redacted: false,
+                state: StreamingState::Log(store.clone(), Vec::new(), 0),
+            }),
+            LfsBlobsStore::Union(a, _) => Self::new(a, hash, size),
+        }
+    }
+
+    pub(crate) fn memory(hash: Sha256, size: u64) -> Self {
+        Self {
+            expected_hash: hash,
+            got_hash: sha2::Sha256::new(),
+            size,
+            written_so_far: 0,
+            redacted: false,
+            state: StreamingState::Memory(Vec::with_capacity(size as usize)),
+        }
+    }
+
+    pub(crate) fn add_chunk(&mut self, chunk: Bytes) -> Result<Option<Vec<u8>>> {
+        if self.redacted {
+            bail!("can't add chunk - already redacted");
+        }
+
+        if self.written_so_far + chunk.len() as u64 > self.size {
+            bail!(
+                "too much data written: {} > {}",
+                self.written_so_far,
+                self.size
+            );
+        }
+
+        self.got_hash.update(chunk.as_ref());
+
+        if self.written_so_far + chunk.len() as u64 == self.size {
+            // Check content hash before inserting the final chunk.
+            let got_hash: [u8; Sha256::len()] =
+                std::mem::take(&mut self.got_hash).finalize().into();
+            let got_hash = Sha256::from(got_hash);
+            if got_hash != self.expected_hash {
+                bail!(
+                    "content hash mismatch: {} != {}",
+                    self.expected_hash,
+                    got_hash
+                );
+            }
+        }
+
+        self.written_so_far += chunk.len() as u64;
+
+        if let Some(mut buf) =
+            self.state
+                .write_chunk(chunk, self.expected_hash, self.written_so_far == self.size)?
+        {
+            buf.clear();
+            return Ok(Some(buf));
+        }
+
+        Ok(None)
+    }
+
+    pub(crate) fn redact(&mut self) -> Result<()> {
+        if self.written_so_far > 0 {
+            bail!("can't redact - already wrote {} bytes", self.written_so_far);
+        }
+
+        self.state.write_chunk(
+            redacted::REDACTED_CONTENT.to_vec().into(),
+            self.expected_hash,
+            true,
+        )?;
+
+        self.redacted = true;
+
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(Sha256, StreamingState)> {
+        if !self.redacted && self.written_so_far < self.size {
+            bail!(
+                "not enough data written: {} < {}",
+                self.written_so_far,
+                self.size
+            );
+        }
+
+        if let StreamingState::File(file) = &mut self.state {
+            file.sync_all()?;
+        }
+
+        Ok((self.expected_hash, self.state))
+    }
+}
+
 pub(crate) enum LfsStoreEntry {
     PointerOnly(LfsPointersEntry),
-    PointerAndBlob(LfsPointersEntry, Bytes),
+    PointerAndBlob(LfsPointersEntry, Blob),
 }
 
 impl LfsStore {
@@ -642,6 +827,16 @@ impl LfsStore {
         let pointers = LfsPointersStore::rotated(path, config)?;
         let blobs = LfsBlobsStore::rotated_or_loose_objects(path, config)?;
         LfsStore::new(pointers, blobs)
+    }
+
+    /// Open a critical section where cache writes are guaranteed to be present on subsequent read
+    /// (if underlying store is indexedlog RotateLog).
+    pub(crate) fn with_consistent_reads(&self) -> Option<ConsistentReadGuard> {
+        if let LfsBlobsStore::IndexedLog(store) = &self.blobs {
+            store.inner.write().with_consistent_reads()
+        } else {
+            None
+        }
     }
 
     pub fn repair(path: impl AsRef<Path>) -> Result<String> {
@@ -677,7 +872,7 @@ impl LfsStore {
                                 hgid,
                             )))
                         }
-                        Some(blob) => Ok(StoreResult::Found((entry, blob))),
+                        Some(blob) => Ok(StoreResult::Found((entry, blob.into_bytes()))),
                     }
                 }
             },
@@ -706,7 +901,10 @@ impl LfsStore {
                         match self.blobs.contains(&content_hash.clone().unwrap_sha256())? {
                             false => Ok(Some(LfsStoreEntry::PointerOnly(entry))),
                             // Insert stub entry since the result doesn't matter.
-                            true => Ok(Some(LfsStoreEntry::PointerAndBlob(entry, Bytes::new()))),
+                            true => Ok(Some(LfsStoreEntry::PointerAndBlob(
+                                entry,
+                                Bytes::new().into(),
+                            ))),
                         }
                     } else {
                         match self
@@ -723,7 +921,7 @@ impl LfsStore {
     }
 
     /// Directly get the local content. Do not ask remote servers.
-    pub(crate) fn get_local_content_direct(&self, id: &HgId) -> Result<Option<Bytes>> {
+    pub(crate) fn get_local_content_direct(&self, id: &HgId) -> Result<Option<Blob>> {
         let pointer = match self.pointers.get_by_hgid(id)? {
             None => return Ok(None),
             Some(v) => v,
@@ -735,48 +933,29 @@ impl LfsStore {
         self.blobs.get(hash.sha256_ref(), pointer.size)
     }
 
+    pub fn get_blob(&self, hash: &Sha256, size: u64) -> Result<Option<Blob>> {
+        self.blobs.get(hash, size)
+    }
+
     pub fn add_blob(&self, hash: &Sha256, blob: Bytes) -> Result<()> {
         self.blobs.add(hash, blob)
+    }
+
+    pub(crate) fn add_blob_and_pointer(&self, key: Key, bytes: Bytes) -> Result<()> {
+        let (lfs_pointer, lfs_blob) = lfs_from_hg_file_blob(key.hgid, &bytes)?;
+        let sha256 = lfs_pointer.sha256();
+        self.blobs.add(&sha256, lfs_blob)?;
+        self.add_pointer(lfs_pointer)
     }
 
     pub(crate) fn add_pointer(&self, pointer_entry: LfsPointersEntry) -> Result<()> {
         self.pointers.add(pointer_entry)
     }
-}
 
-impl LocalStore for LfsStore {
-    fn get_missing(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>> {
-        Ok(keys
-            .iter()
-            .filter_map(|k| match k {
-                StoreKey::HgId(key) => {
-                    let entry = self.pointers.get(&k.clone());
-                    match entry {
-                        Ok(None) | Err(_) => Some(k.clone()),
-                        Ok(Some(entry)) => match entry.content_hashes.get(&ContentHashType::Sha256)
-                        {
-                            None => None,
-                            Some(content_hash) => {
-                                let sha256 = content_hash.clone().unwrap_sha256();
-                                match self.blobs.contains(&sha256) {
-                                    Ok(true) => None,
-                                    Ok(false) | Err(_) => Some(StoreKey::Content(
-                                        content_hash.clone(),
-                                        Some(key.clone()),
-                                    )),
-                                }
-                            }
-                        },
-                    }
-                }
-                StoreKey::Content(content_hash, _) => match content_hash {
-                    ContentHash::Sha256(hash) => match self.blobs.contains(hash) {
-                        Ok(true) => None,
-                        Ok(false) | Err(_) => Some(k.clone()),
-                    },
-                },
-            })
-            .collect())
+    pub fn flush(&self) -> Result<()> {
+        self.blobs.flush()?;
+        self.pointers.0.flush()?;
+        Ok(())
     }
 }
 
@@ -825,38 +1004,6 @@ pub(crate) fn lfs_from_hg_file_blob(
     let (data, copy_from) = strip_file_metadata(raw_content, SerializationFormat::Hg)?;
     let pointer = LfsPointersEntry::from_file_content(hgid, &data, copy_from)?;
     Ok((pointer, data))
-}
-
-impl HgIdDataStore for LfsStore {
-    fn get(&self, key: StoreKey) -> Result<StoreResult<Vec<u8>>> {
-        match self.blob_impl(key)? {
-            StoreResult::Found((entry, content)) => {
-                let content = rebuild_metadata(content, &entry);
-                // PERF: Consider changing HgIdDataStore::get() to return Bytes to avoid copying data.
-                Ok(StoreResult::Found(content.as_ref().to_vec()))
-            }
-            StoreResult::NotFound(key) => Ok(StoreResult::NotFound(key)),
-        }
-    }
-
-    fn refresh(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl HgIdMutableDeltaStore for LfsStore {
-    fn add(&self, delta: &Delta, _metadata: &Metadata) -> Result<()> {
-        ensure!(delta.base.is_none(), "Deltas aren't supported.");
-        let (lfs_pointer_entry, blob) = lfs_from_hg_file_blob(delta.key.hgid, &delta.data)?;
-        self.blobs.add(&lfs_pointer_entry.sha256(), blob)?;
-        self.pointers.add(lfs_pointer_entry)
-    }
-
-    fn flush(&self) -> Result<Option<Vec<PathBuf>>> {
-        self.blobs.flush()?;
-        self.pointers.0.flush()?;
-        Ok(None)
-    }
 }
 
 impl From<LfsPointersEntry> for ContentMetadata {
@@ -1028,7 +1175,7 @@ impl LfsRemote {
                 format!("Sapling/{}", ::version::VERSION)
             })?;
 
-            let concurrent_fetches = config.get_or("lfs", "concurrentfetches", || 4)?;
+            let concurrent_fetches = config.get_or("lfs", "concurrentfetches", || 30)?;
 
             let backoff_times = config.get_or("lfs", "backofftimes", || vec![1f32, 4f32, 8f32])?;
 
@@ -1075,13 +1222,12 @@ impl LfsRemote {
                     window: low_speed_grace_period,
                 });
 
-            let download_chunk_size = config.get_opt::<u64>("lfs", "download-chunk-size")?;
-            let download_chunk_size = download_chunk_size
-                .map(|s| NonZeroU64::new(s).context("download chunk size cannot be 0"))
-                .transpose()?;
-
-            // Pick something relatively low. Doesn't seem like we need many concurrent LFS downloads to saturate available BW.
-            let max_batch_size = config.get_or("lfs", "max-batch-size", || 100)?;
+            let download_chunk_size =
+                config.get_or::<ByteCount>("lfs", "download-chunk-size", || {
+                    (5 * 1024 * 1024).into()
+                })?;
+            let download_chunk_size = NonZeroU64::new(download_chunk_size.value())
+                .context("download chunk size cannot be 0")?;
 
             let client = http_client("lfs", http_config(config, &url)?);
 
@@ -1090,7 +1236,7 @@ impl LfsRemote {
                 client: Arc::new(client),
                 concurrent_fetches,
                 download_chunk_size,
-                max_batch_size,
+                buf_pool: LimitedBufferPool::new(concurrent_fetches),
                 http_options: Arc::new(HttpOptions {
                     accept_zstd,
                     http_version,
@@ -1104,14 +1250,21 @@ impl LfsRemote {
         }
     }
 
+    /// Legacy API that reads entire LFS object into memory, passing to callback.
+    /// Prefer using LfsClient::batch_fetch.
     pub fn batch_fetch(
         &self,
         fctx: FetchContext,
         objs: &HashSet<(Sha256, usize)>,
-        write_to_store: impl FnMut(Sha256, Bytes) -> Result<()>,
+        mut write_to_store: impl FnMut(Sha256, Bytes) -> Result<()>,
         error_handler: impl FnMut(Sha256, Error),
     ) -> Result<()> {
         let read_from_store = |_sha256, _size| unreachable!();
+        let make_inserter = |hash, size| Ok(StreamingInserter::memory(hash, size));
+        let done_cb = |hash, state| match state {
+            StreamingState::Memory(buf) => write_to_store(hash, buf.into()),
+            _ => bail!("unexpected StreamingState"),
+        };
         match self {
             LfsRemote::Http(http) => Self::batch_http(
                 Some(fctx),
@@ -1119,7 +1272,8 @@ impl LfsRemote {
                 objs,
                 Operation::Download,
                 read_from_store,
-                write_to_store,
+                make_inserter,
+                done_cb,
                 error_handler,
             ),
             LfsRemote::File(file) => Self::batch_fetch_file(file, objs, write_to_store),
@@ -1132,7 +1286,8 @@ impl LfsRemote {
         read_from_store: impl Fn(Sha256, u64) -> Result<Option<Bytes>> + Send + Clone + 'static,
         error_handler: impl FnMut(Sha256, Error),
     ) -> Result<()> {
-        let write_to_store = |_, _| unreachable!();
+        let make_inserter = |_, _| unreachable!();
+        let done = |_, _| unreachable!();
         match self {
             LfsRemote::Http(http) => Self::batch_http(
                 None,
@@ -1140,7 +1295,8 @@ impl LfsRemote {
                 objs,
                 Operation::Upload,
                 read_from_store,
-                write_to_store,
+                make_inserter,
+                done,
                 error_handler,
             ),
             LfsRemote::File(file) => Self::batch_upload_file(file, objs, read_from_store),
@@ -1155,6 +1311,7 @@ impl LfsRemote {
         add_extra: impl Fn(Request) -> Request,
         check_status: impl Fn(StatusCode) -> Result<(), TransferError>,
         http_options: Arc<HttpOptions>,
+        mut chunk_buf: Option<Vec<u8>>,
     ) -> Result<Bytes, FetchError> {
         let span = trace_span!("LfsRemote::send_with_retry", url = %url);
 
@@ -1169,6 +1326,8 @@ impl LfsRemote {
 
             loop {
                 attempt += 1;
+
+                let mut chunk_buf = chunk_buf.take();
 
                 let mut req = client
                     .new_request(url.clone(), method)
@@ -1224,7 +1383,7 @@ impl LfsRemote {
 
                     let start = Instant::now();
                     let mut body = body.decoded();
-                    let mut chunks: Vec<Vec<u8>> = vec![];
+                    let mut chunks: Vec<Vec<u8>> = Vec::new();
                     while let Some(res) = timeout(request_timeout, body.next()).await.transpose() {
                         let chunk = res.map_err(|_| {
                             let request_id = head
@@ -1243,10 +1402,18 @@ impl LfsRemote {
                             }
                         })??;
 
-                        chunks.push(chunk);
+                        if let Some(buf) = chunk_buf.as_mut() {
+                            buf.extend_from_slice(&chunk);
+                        } else {
+                            chunks.push(chunk);
+                        }
                     }
 
-                    Result::<_, TransferError>::Ok(join_chunks(&chunks))
+                    if let Some(buf) = chunk_buf {
+                        Result::<_, TransferError>::Ok(buf.into())
+                    } else {
+                        Result::<_, TransferError>::Ok(join_chunks(&chunks))
+                    }
                 }
                 .await;
 
@@ -1348,6 +1515,7 @@ impl LfsRemote {
                 move |builder| builder.body(batch_json.clone()),
                 |_| Ok(()),
                 http.http_options.clone(),
+                None,
             )
             .await
         };
@@ -1383,6 +1551,7 @@ impl LfsRemote {
             },
             |_| Ok(()),
             http_options,
+            None,
         )
         .await?;
 
@@ -1392,87 +1561,88 @@ impl LfsRemote {
     async fn process_download(
         fctx: Option<FetchContext>,
         client: Arc<HttpClient>,
-        chunk_size: Option<NonZeroU64>,
+        chunk_size: NonZeroU64,
         action: ObjectAction,
-        oid: Sha256,
         size: u64,
         http_options: Arc<HttpOptions>,
-    ) -> Result<(Sha256, Bytes)> {
+        mut inserter: StreamingInserter,
+        buf_pool: LimitedBufferPool,
+    ) -> Result<(Sha256, StreamingState)> {
         let url = Url::from_str(&action.href.to_string())?;
 
-        let data = match chunk_size {
-            Some(chunk_size) => {
-                let chunk_increment = chunk_size.get() - 1;
+        let chunk_increment = chunk_size.get() - 1;
 
-                async {
-                    let mut chunks = Vec::new();
-                    let mut chunk_start = 0;
+        let mut chunk_start = 0;
 
-                    let file_end = size.saturating_sub(1);
+        let file_end = size.saturating_sub(1);
 
-                    while chunk_start < file_end {
-                        let chunk_end = std::cmp::min(file_end, chunk_start + chunk_increment);
-                        let range = format!("bytes={}-{}", chunk_start, chunk_end);
+        // Recyclable buffer we use for each chunk.
+        let (pool_handle, mut buf) = buf_pool.get().await;
 
-                        let chunk = LfsRemote::send_with_retry(
-                            fctx.clone(),
-                            client.clone(),
-                            Method::Get,
-                            url.clone(),
-                            |builder| {
-                                let builder = add_action_headers_to_request(builder, &action);
-                                builder.header("Range", &range)
-                            },
-                            |status| {
-                                if status == http::StatusCode::PARTIAL_CONTENT {
-                                    return Ok(());
-                                }
+        buf.reserve(chunk_size.get().min(size) as usize);
 
-                                Err(TransferError::UnexpectedHttpStatus {
-                                    expected: http::StatusCode::PARTIAL_CONTENT,
-                                    received: status,
-                                })
-                            },
-                            http_options.clone(),
-                        )
-                        .await?;
+        let mut buf = Some(buf);
 
-                        chunks.push(chunk);
+        while chunk_start < file_end {
+            let chunk_end = std::cmp::min(file_end, chunk_start + chunk_increment);
+            let range = format!("bytes={}-{}", chunk_start, chunk_end);
 
-                        chunk_start = chunk_end + 1;
+            let chunk_res = LfsRemote::send_with_retry(
+                fctx.clone(),
+                client.clone(),
+                Method::Get,
+                url.clone(),
+                |builder| {
+                    let builder = add_action_headers_to_request(builder, &action);
+                    builder.header("Range", &range)
+                },
+                |status| {
+                    if status == http::StatusCode::PARTIAL_CONTENT {
+                        return Ok(());
                     }
 
-                    Result::<_, FetchError>::Ok(join_chunks(&chunks))
-                }
-                .await
-            }
-            None => {
-                LfsRemote::send_with_retry(
-                    fctx,
-                    client,
-                    Method::Get,
-                    url,
-                    |builder| add_action_headers_to_request(builder, &action),
-                    |_| Ok(()),
-                    http_options,
-                )
-                .await
-            }
-        };
+                    // 200 is okay if we requested the entire file in one chunk.
+                    if chunk_start == 0 && chunk_end == file_end && status == http::StatusCode::OK {
+                        return Ok(());
+                    }
 
-        let data = match data {
-            Ok(data) => data,
-            Err(err) => match err.error {
-                TransferError::HttpStatus(http::StatusCode::GONE, _) => {
-                    Bytes::from_static(redacted::REDACTED_CONTENT)
-                }
-                _ => {
-                    return Err(err.into());
-                }
-            },
-        };
+                    Err(TransferError::UnexpectedHttpStatus {
+                        expected: http::StatusCode::PARTIAL_CONTENT,
+                        received: status,
+                    })
+                },
+                http_options.clone(),
+                buf,
+            )
+            .await;
 
-        Ok((oid, data))
+            match chunk_res {
+                Ok(chunk) => {
+                    // add_chunk() is blocking and quite slow (sha256 hash and indexedlog append).
+                    // It slows down the async execution by more than 50% - we must spawn_blocking.
+                    (inserter, buf) = spawn_blocking(move || {
+                        let buf = inserter.add_chunk(chunk)?;
+                        Ok::<_, Error>((inserter, buf))
+                    })
+                    .await??;
+                }
+                Err(err) => match err.error {
+                    TransferError::HttpStatus(http::StatusCode::GONE, _) => {
+                        inserter.redact()?;
+                        return inserter.finish();
+                    }
+                    _ => return Err(err.into()),
+                },
+            };
+
+            chunk_start = chunk_end + 1;
+        }
+
+        if let Some(buf) = buf {
+            pool_handle.put(buf);
+        }
+
+        inserter.finish()
     }
 
     /// Fetch and Upload blobs from the LFS server.
@@ -1487,88 +1657,87 @@ impl LfsRemote {
         objs: &HashSet<(Sha256, usize)>,
         operation: Operation,
         read_from_store: impl Fn(Sha256, u64) -> Result<Option<Bytes>> + Send + Clone + 'static,
-        mut write_to_store: impl FnMut(Sha256, Bytes) -> Result<()>,
+        mut make_inserter: impl FnMut(Sha256, u64) -> Result<StreamingInserter>,
+        mut done_cb: impl FnMut(Sha256, StreamingState) -> Result<()>,
         mut error_handler: impl FnMut(Sha256, Error),
     ) -> Result<()> {
-        let request_objs_iter = objs.iter().map(|(oid, size)| RequestObject {
-            oid: LfsSha256(oid.into_inner()),
-            size: *size as u64,
-        });
+        let objs = objs
+            .iter()
+            .map(|(oid, size)| RequestObject {
+                oid: LfsSha256(oid.into_inner()),
+                size: *size as u64,
+            })
+            .collect::<Vec<_>>();
 
-        for request_objs_chunk in &request_objs_iter.chunks(http.max_batch_size) {
-            let response = LfsRemote::send_batch_request(
-                fctx.clone(),
-                http,
-                request_objs_chunk.collect(),
-                operation,
-            )?;
-            let response = match response {
-                None => return Ok(()),
-                Some(response) => response,
+        let response = LfsRemote::send_batch_request(fctx.clone(), http, objs, operation)?;
+
+        let response = match response {
+            None => return Ok(()),
+            Some(response) => response,
+        };
+
+        let mut futures = Vec::new();
+
+        for object in response.objects {
+            let oid = object.object.oid;
+            let actions = match object.status {
+                ObjectStatus::Ok {
+                    authenticated: _,
+                    actions,
+                } => Some(actions),
+                ObjectStatus::Err { error: e } => {
+                    error_handler(
+                        Sha256::from(oid.0),
+                        anyhow!("LFS fetch error {} - {}", e.code, e.message),
+                    );
+                    None
+                }
             };
 
-            let mut futures = Vec::new();
+            for (op, action) in actions.into_iter().flat_map(|h| h.into_iter()) {
+                let oid = Sha256::from(oid.0);
 
-            for object in response.objects {
-                let oid = object.object.oid;
-                let actions = match object.status {
-                    ObjectStatus::Ok {
-                        authenticated: _,
-                        actions,
-                    } => Some(actions),
-                    ObjectStatus::Err { error: e } => {
-                        error_handler(
-                            Sha256::from(oid.0),
-                            anyhow!("LFS fetch error {} - {}", e.code, e.message),
-                        );
-                        None
-                    }
+                let fut = match op {
+                    Operation::Upload => LfsRemote::process_upload(
+                        http.client.clone(),
+                        action,
+                        oid,
+                        object.object.size,
+                        read_from_store.clone(),
+                        http.http_options.clone(),
+                    )
+                    .map(|res| match res {
+                        Ok(()) => None,
+                        Err(err) => Some(Err(err)),
+                    })
+                    .left_future(),
+                    Operation::Download => LfsRemote::process_download(
+                        fctx.clone(),
+                        http.client.clone(),
+                        http.download_chunk_size,
+                        action,
+                        object.object.size,
+                        http.http_options.clone(),
+                        make_inserter(oid, object.object.size)?,
+                        http.buf_pool.clone(),
+                    )
+                    .map(Some)
+                    .right_future(),
                 };
 
-                for (op, action) in actions.into_iter().flat_map(|h| h.into_iter()) {
-                    let oid = Sha256::from(oid.0);
-
-                    let fut = match op {
-                        Operation::Upload => LfsRemote::process_upload(
-                            http.client.clone(),
-                            action,
-                            oid,
-                            object.object.size,
-                            read_from_store.clone(),
-                            http.http_options.clone(),
-                        )
-                        .map(|res| match res {
-                            Ok(()) => None,
-                            Err(err) => Some(Err(err)),
-                        })
-                        .left_future(),
-                        Operation::Download => LfsRemote::process_download(
-                            fctx.clone(),
-                            http.client.clone(),
-                            http.download_chunk_size,
-                            action,
-                            oid,
-                            object.object.size,
-                            http.http_options.clone(),
-                        )
-                        .map(Some)
-                        .right_future(),
-                    };
-
-                    futures.push(fut);
-                }
+                futures.push(fut);
             }
+        }
 
-            // Request blobs concurrently.
-            let stream = stream_to_iter(iter(futures).buffer_unordered(http.concurrent_fetches));
+        // Request blobs concurrently.
+        let stream = stream_to_iter(iter(futures).buffer_unordered(http.concurrent_fetches));
 
-            // It's awkward that the futures are shared for uploading and downloading. We use Some(_)
-            // to indicate if the result came from the download path, and 'flatten' filters out the
-            // Nones.
-            for result in stream.flatten() {
-                let (sha, data) = result?;
-                write_to_store(sha, data)?;
-            }
+        // It's awkward that the futures are shared for uploading and downloading. We use Some(_)
+        // to indicate if the result came from the download path, and 'flatten' filters out the
+        // Nones.
+        for result in stream.flatten() {
+            let (sha, state) = result?;
+            done_cb(sha, state)?;
         }
 
         Ok(())
@@ -1582,7 +1751,7 @@ impl LfsRemote {
     ) -> Result<()> {
         for (hash, size) in objs {
             if let Some(data) = file.get(hash, *size as u64)? {
-                write_to_store(*hash, data)?;
+                write_to_store(*hash, data.into_bytes())?;
             }
         }
 
@@ -1611,26 +1780,50 @@ impl LfsClient {
         config: &dyn Config,
     ) -> Result<Self> {
         let move_after_upload = config.get_or("lfs", "moveafterupload", || false)?;
-        let ignore_prefetch_errors = config.get_or("lfs", "ignore-prefetch-errors", || false)?;
 
         Ok(Self {
             shared,
             local,
-            ignore_prefetch_errors,
             move_after_upload,
-            remote: LfsRemote::from_config(config)?,
+            remote: Arc::new(LfsRemote::from_config(config)?),
         })
     }
 
-    fn batch_fetch(
+    /// Fetch specified objects from remote server, saving results into shared cache. Results are
+    /// streamed into shared cache, skipping only the final chunk if there is a content hash
+    /// mismatch.
+    pub fn batch_fetch(
         &self,
         fctx: FetchContext,
         objs: &HashSet<(Sha256, usize)>,
-        write_to_store: impl FnMut(Sha256, Bytes) -> Result<()>,
+        mut done_cb: impl FnMut(Sha256),
         error_handler: impl FnMut(Sha256, Error),
     ) -> Result<()> {
-        self.remote
-            .batch_fetch(fctx, objs, write_to_store, error_handler)
+        match self.remote.as_ref() {
+            LfsRemote::Http(http) => {
+                let make_inserter =
+                    |hash, size| StreamingInserter::new(&self.shared.blobs, hash, size);
+
+                let done_cb = |hash: Sha256, _state: StreamingState| Ok(done_cb(hash));
+
+                LfsRemote::batch_http(
+                    Some(fctx),
+                    http,
+                    objs,
+                    Operation::Download,
+                    |_sha256, _size| unreachable!(),
+                    make_inserter,
+                    done_cb,
+                    error_handler,
+                )
+            }
+
+            LfsRemote::File(file) => LfsRemote::batch_fetch_file(file, objs, |hash, bytes| {
+                self.shared.add_blob(&hash, bytes)?;
+                done_cb(hash);
+                Ok(())
+            }),
+        }
     }
 
     fn batch_upload(
@@ -1712,24 +1905,30 @@ impl LfsClient {
 
         Ok(not_found)
     }
-}
 
-impl HgIdRemoteStore for LfsClient {
-    fn datastore(
-        self: Arc<Self>,
-        store: Arc<dyn HgIdMutableDeltaStore>,
-    ) -> Arc<dyn RemoteDataStore> {
-        Arc::new(LfsRemoteStore {
-            store,
-            remote: self,
-        })
+    pub(crate) fn with_shared_only(&self) -> Self {
+        let mut c = self.clone();
+        c.local = Some(self.shared.clone());
+        c
     }
 
-    fn historystore(
-        self: Arc<Self>,
-        _store: Arc<dyn HgIdMutableHistoryStore>,
-    ) -> Arc<dyn RemoteHistoryStore> {
-        unreachable!()
+    pub(crate) fn flush(&self) -> Result<()> {
+        let mut res = Ok(());
+
+        if let Some(err) = self.local.as_ref().and_then(|l| l.flush().err()) {
+            res = Err(err);
+        }
+
+        if let Some(err) = self.shared.flush().err() {
+            res = Err(err);
+        }
+
+        if let LfsRemote::Http(http) = self.remote.as_ref() {
+            // Try to drop any big buffers we are holding on to.
+            http.buf_pool.gc();
+        }
+
+        res
     }
 }
 
@@ -1744,7 +1943,7 @@ fn move_blob(hash: &Sha256, size: u64, from: &LfsStore, to: &LfsStore) -> Result
             .get(hash, size)?
             .ok_or_else(|| format_err!("Cannot find blob for {}", hash))?;
 
-        to.blobs.add(hash, blob)?;
+        to.blobs.add(hash, blob.into_bytes())?;
         from.blobs.remove(hash)?;
 
         (|| -> Result<()> {
@@ -1757,129 +1956,6 @@ fn move_blob(hash: &Sha256, size: u64, from: &LfsStore, to: &LfsStore) -> Result
         .with_context(|| format!("Cannot move pointer for {}", hash))
     })()
     .with_context(|| format!("Cannot move blob {}", hash))
-}
-
-struct LfsRemoteStore {
-    store: Arc<dyn HgIdMutableDeltaStore>,
-    remote: Arc<LfsClient>,
-}
-
-impl RemoteDataStore for LfsRemoteStore {
-    fn prefetch(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>> {
-        let mut not_found = Vec::new();
-
-        let stores = if let Some(local_store) = self.remote.local.as_ref() {
-            vec![
-                (self.remote.shared.clone(), false),
-                (local_store.clone(), true),
-            ]
-        } else {
-            vec![(self.remote.shared.clone(), false)]
-        };
-
-        let mut obj_set = HashMap::new();
-        let objs = keys
-            .iter()
-            .map(|k| {
-                for (store, is_local) in &stores {
-                    if let Some(pointer) = store.pointers.entry(k)? {
-                        if let Some(content_hash) =
-                            pointer.content_hashes.get(&ContentHashType::Sha256)
-                        {
-                            obj_set.insert(
-                                content_hash.clone().unwrap_sha256(),
-                                (k.clone(), *is_local),
-                            );
-                            return Ok(Some((
-                                content_hash.clone().unwrap_sha256(),
-                                pointer.size.try_into()?,
-                            )));
-                        }
-                    }
-                }
-
-                not_found.push(k.clone());
-                Ok(None)
-            })
-            .filter_map(|res| res.transpose())
-            .collect::<Result<HashSet<_>>>()?;
-
-        // If there are no objects involved at all, then don't make an (expensive) remote request!
-        if objs.is_empty() {
-            return Ok(not_found);
-        }
-
-        let span = info_span!(
-            "LfsRemoteStore::prefetch",
-            num_blobs = objs.len(),
-            size = &0
-        );
-        let _guard = span.enter();
-
-        let size = Arc::new(AtomicUsize::new(0));
-        let obj_set = Arc::new(Mutex::new(obj_set));
-
-        let fctx = FetchContext::sapling_prefetch();
-
-        self.remote.batch_fetch(
-            fctx,
-            &objs,
-            {
-                let remote = self.remote.clone();
-                let size = size.clone();
-                let obj_set = obj_set.clone();
-
-                move |sha256, data| {
-                    size.fetch_add(data.len(), Ordering::Relaxed);
-                    let (_, is_local) = obj_set
-                        .lock()
-                        .remove(&sha256)
-                        .ok_or_else(|| format_err!("Cannot find {}", sha256))?;
-
-                    if is_local {
-                        // Safe to unwrap as the sha256 is coming from a local LFS pointer.
-                        remote.local.as_ref().unwrap().blobs.add(&sha256, data)
-                    } else {
-                        remote.shared.blobs.add(&sha256, data)
-                    }
-                }
-            },
-            |_, _| {},
-        )?;
-        span.record("size", size.load(Ordering::Relaxed));
-
-        let obj_set = mem::take(&mut *obj_set.lock());
-        not_found.extend(obj_set.into_iter().map(|(sha256, (k, _))| match k {
-            StoreKey::Content(content, hgid) => StoreKey::Content(content, hgid),
-            StoreKey::HgId(hgid) => StoreKey::Content(ContentHash::Sha256(sha256), Some(hgid)),
-        }));
-
-        Ok(not_found)
-    }
-
-    fn upload(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>> {
-        self.remote.upload(keys)
-    }
-}
-
-impl HgIdDataStore for LfsRemoteStore {
-    fn get(&self, key: StoreKey) -> Result<StoreResult<Vec<u8>>> {
-        match self.prefetch(&[key.clone()]) {
-            Ok(_) => self.store.get(key),
-            Err(_) if self.remote.ignore_prefetch_errors => Ok(StoreResult::NotFound(key)),
-            Err(e) => Err(e.context(format!("Failed to fetch: {:?}", key))),
-        }
-    }
-
-    fn refresh(&self) -> Result<()> {
-        Ok(())
-    }
-}
-
-impl LocalStore for LfsRemoteStore {
-    fn get_missing(&self, keys: &[StoreKey]) -> Result<Vec<StoreKey>> {
-        self.store.get_missing(keys)
-    }
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -1941,10 +2017,103 @@ fn join_chunks<T: AsRef<[u8]>>(chunks: &[T]) -> Bytes {
     result.into()
 }
 
+/// LimitedBufferPool acts both as a pool to reuse Vec<u8> buffers, and as a request limiter
+/// to only allow N concurrent requests at once.
+#[derive(Clone)]
+struct LimitedBufferPool {
+    tx: flume::Sender<(Vec<u8>, Instant)>,
+    rx: flume::Receiver<(Vec<u8>, Instant)>,
+    gc_timeout: Duration,
+}
+
+impl LimitedBufferPool {
+    pub(crate) fn new(max: usize) -> Self {
+        let (tx, rx) = flume::bounded(max);
+
+        let pool = Self {
+            tx,
+            rx,
+            gc_timeout: Duration::from_secs(60),
+        };
+
+        for _ in 0..max {
+            pool.put(Vec::new());
+        }
+
+        pool
+    }
+
+    /// Get a PoolHandle and a buffer. You should call `handle.put(buf)` when you are done with the
+    /// buf.
+    pub(crate) async fn get(&self) -> (PoolHandle, Vec<u8>) {
+        let (mut buf, _) = self.rx.recv_async().await.unwrap();
+        buf.clear();
+
+        (
+            PoolHandle {
+                pool: self.clone(),
+                returned: AtomicBool::new(false),
+            },
+            buf,
+        )
+    }
+
+    /// Internal method - put buf back.
+    fn put(&self, buf: Vec<u8>) {
+        self.tx.try_send((buf, Instant::now())).ok();
+    }
+
+    /// Drop buffers that haven't been used in the last 1 minute.
+    pub(crate) fn gc(&self) {
+        // Bound our iterations to capacity to be extra sure we can't get stuck looping.
+        for _ in 0..self.tx.capacity().unwrap_or_default() {
+            // Iterate through buffers, oldest first.
+            if let Ok((buf, ts)) = self.rx.try_recv() {
+                if ts.elapsed() < self.gc_timeout {
+                    // Buffer was used in last minute - put it back and stop gc().
+                    self.put(buf);
+                    break;
+                } else {
+                    // Buffer wasn't used in last minute - drop it and put an empty buffer back in.
+                    if buf.capacity() > 0 {
+                        tracing::trace!("dropping LFS buffer of capacity {}", buf.capacity());
+                    }
+                    self.put(Vec::new());
+                }
+            }
+        }
+    }
+}
+
+struct PoolHandle {
+    pool: LimitedBufferPool,
+    returned: AtomicBool,
+}
+
+impl Drop for PoolHandle {
+    /// User didn't call PoolHandle::put() - release the spot in pool even though we don't have a
+    /// buffer to return.
+    fn drop(&mut self) {
+        if !self.returned.swap(true, Ordering::AcqRel) {
+            self.pool.put(Vec::new());
+        }
+    }
+}
+
+impl PoolHandle {
+    /// Put buf back in pool for reuse.
+    pub(crate) fn put(self, buf: Vec<u8>) {
+        if !self.returned.swap(true, Ordering::AcqRel) {
+            self.pool.put(buf);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
+    use parking_lot::Mutex;
     use quickcheck::quickcheck;
     use storemodel::SerializationFormat;
     use tempfile::TempDir;
@@ -2001,23 +2170,19 @@ mod tests {
         let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::from(&[1, 2, 3, 4][..]),
-            base: None,
-            key: k1,
-        };
 
-        store.add(&delta, &Default::default())?;
+        let data = Bytes::from(&[1, 2, 3, 4][..]);
+        store.add_blob_and_pointer(k1, data.clone())?;
         store.flush()?;
 
         let indexedlog_blobs = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
-        let hash = ContentHash::sha256(&delta.data).unwrap_sha256();
+        let hash = ContentHash::sha256(&data).unwrap_sha256();
 
         assert!(indexedlog_blobs.contains(&hash)?);
 
         assert_eq!(
-            Some(delta.data.clone()),
-            indexedlog_blobs.get(&hash, delta.data.len() as u64)?
+            Some(data.clone().into()),
+            indexedlog_blobs.get(&hash, data.len() as u64)?
         );
 
         Ok(())
@@ -2036,31 +2201,10 @@ mod tests {
         loose_store.add(&sha256, data.clone())?;
 
         assert!(blob_store.contains(&sha256)?);
-        assert_eq!(blob_store.get(&sha256, data.len() as u64)?, Some(data));
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_add_get_missing() -> Result<()> {
-        let dir = TempDir::new()?;
-        let server = mockito::Server::new();
-        let config = make_lfs_config(&server, &dir, "test_add_get_missing");
-        let store = LfsStore::rotated(&dir, &config)?;
-
-        let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::from(&[1, 2, 3, 4][..]),
-            base: None,
-            key: k1.clone(),
-        };
-
         assert_eq!(
-            store.get_missing(&[StoreKey::from(&k1)])?,
-            vec![StoreKey::from(&k1)]
+            blob_store.get(&sha256, data.len() as u64)?,
+            Some(data.into())
         );
-        store.add(&delta, &Default::default())?;
-        assert_eq!(store.get_missing(&[StoreKey::from(k1)])?, vec![]);
 
         Ok(())
     }
@@ -2073,15 +2217,12 @@ mod tests {
         let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::from(&[1, 2, 3, 4][..]),
-            base: None,
-            key: k1.clone(),
-        };
+        let data = Bytes::from(&[1, 2, 3, 4][..]);
 
-        store.add(&delta, &Default::default())?;
-        let stored = store.get(StoreKey::hgid(k1))?;
-        assert_eq!(StoreResult::Found(delta.data.as_ref().to_vec()), stored);
+        store.add_blob_and_pointer(k1.clone(), data.clone())?;
+
+        let stored = store.blob(StoreKey::hgid(k1))?;
+        assert_eq!(StoreResult::Found(data), stored);
 
         Ok(())
     }
@@ -2134,7 +2275,7 @@ mod tests {
         store.flush()?;
 
         // Make sure we get the new data.
-        assert_eq!(store.get(&hash, data.len() as u64)?, Some(data));
+        assert_eq!(store.get(&hash, data.len() as u64)?, Some(data.into()));
 
         Ok(())
     }
@@ -2149,21 +2290,17 @@ mod tests {
         let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::from(&[1, 2, 3, 4][..]),
-            base: None,
-            key: k1.clone(),
-        };
+        let data = Bytes::from(&[1, 2, 3, 4][..]);
 
-        store.add(&delta, &Default::default())?;
+        store.add_blob_and_pointer(k1.clone(), data.clone())?;
         let k = StoreKey::hgid(k1);
-        let stored = store.get(k.clone())?;
-        assert_eq!(StoreResult::Found(delta.data.as_ref().to_vec()), stored);
+        let stored = store.blob(k.clone())?;
+        assert_eq!(StoreResult::Found(data.clone()), stored);
 
         store.flush()?;
 
-        let stored = store.get(k)?;
-        assert_eq!(StoreResult::Found(delta.data.as_ref().to_vec()), stored);
+        let stored = store.blob(k)?;
+        assert_eq!(StoreResult::Found(data), stored);
 
         Ok(())
     }
@@ -2232,7 +2369,7 @@ mod tests {
 
         store.flush()?;
 
-        assert_eq!(store.get(&sha256, data.len() as u64)?, Some(data));
+        assert_eq!(store.get(&sha256, data.len() as u64)?, Some(data.into()));
 
         Ok(())
     }
@@ -2275,7 +2412,7 @@ mod tests {
 
         store.flush()?;
 
-        assert_eq!(store.get(&sha256, data.len() as u64)?, Some(data));
+        assert_eq!(store.get(&sha256, data.len() as u64)?, Some(data.into()));
 
         Ok(())
     }
@@ -2310,21 +2447,17 @@ mod tests {
         let store = LfsStore::rotated(&dir, &config)?;
 
         let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::copy_from_slice(
-                format!(
-                    "\x01\ncopy: {}\ncopyrev: {}\n\x01\nthis is a blob",
-                    k1.path, k1.hgid
-                )
-                .as_bytes(),
-            ),
-            base: None,
-            key: k1.clone(),
-        };
+        let data = Bytes::copy_from_slice(
+            format!(
+                "\x01\ncopy: {}\ncopyrev: {}\n\x01\nthis is a blob",
+                k1.path, k1.hgid
+            )
+            .as_bytes(),
+        );
 
-        store.add(&delta, &Default::default())?;
-        let stored = store.get(StoreKey::hgid(k1))?;
-        assert_eq!(StoreResult::Found(delta.data.as_ref().to_vec()), stored);
+        store.add_blob_and_pointer(k1.clone(), data.clone())?;
+        let stored = store.blob(StoreKey::hgid(k1))?;
+        assert_eq!(StoreResult::Found(Bytes::from("this is a blob")), stored);
 
         Ok(())
     }
@@ -2390,7 +2523,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>();
-            remote.batch_fetch(
+            remote.remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
                 sentinel.as_callback(),
@@ -2425,7 +2558,7 @@ mod tests {
             let resp = remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
-                |_, _| unreachable!(),
+                |_| unreachable!(),
                 |_, _| {},
             );
             // ex. [56] Failure when receiving data from the peer (Proxy CONNECT aborted)
@@ -2459,7 +2592,7 @@ mod tests {
             let resp = remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
-                |_, _| unreachable!(),
+                |_| unreachable!(),
                 |_, _| {},
             );
             assert!(resp.is_err());
@@ -2494,7 +2627,7 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<HashSet<_>>();
-            remote.batch_fetch(
+            remote.remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
                 sentinel.as_callback(),
@@ -2537,7 +2670,7 @@ mod tests {
             .collect::<HashSet<_>>();
 
             let out = Arc::new(Mutex::new(Vec::new()));
-            remote.batch_fetch(
+            remote.remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
                 {
@@ -2669,60 +2802,10 @@ mod tests {
             let res = remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
-                |_, _| unreachable!(),
+                |_| unreachable!(),
                 |_, _| {},
             );
             assert!(res.is_err());
-
-            Ok(())
-        }
-
-        #[test]
-        fn test_lfs_remote_datastore() -> Result<()> {
-            let _env_lock = crate::env_lock();
-
-            let cachedir = TempDir::new()?;
-            let lfsdir = TempDir::new()?;
-            let mut server = mockito::Server::new();
-            let config = make_lfs_config(&server, &cachedir, "test_lfs_remote_datastore");
-
-            let blob = &example_blob();
-
-            let _m1 = get_lfs_batch_mock(&mut server, 200, &[blob]);
-            let _m2 = get_lfs_download_mock(&mut server, 200, blob);
-
-            let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
-            let remote = Arc::new(LfsClient::new(lfs.clone(), None, &config)?);
-
-            let key = key("a/b", "1234");
-
-            let mut content_hashes = HashMap::new();
-            content_hashes.insert(ContentHashType::Sha256, ContentHash::Sha256(blob.sha));
-
-            let pointer = LfsPointersEntry {
-                hgid: key.hgid.clone(),
-                size: blob.size as u64,
-                is_binary: false,
-                copy_from: None,
-                content_hashes,
-            };
-
-            // Populate the pointer store. Usually, this would be done via a previous remotestore call.
-            lfs.pointers.add(pointer)?;
-
-            let remotedatastore = remote.datastore(lfs);
-
-            let expected_delta = Delta {
-                data: blob.content.clone(),
-                base: None,
-                key: key.clone(),
-            };
-
-            let stored = remotedatastore.get(StoreKey::hgid(key))?;
-            assert_eq!(
-                stored,
-                StoreResult::Found(expected_delta.data.as_ref().to_vec())
-            );
 
             Ok(())
         }
@@ -2760,11 +2843,11 @@ mod tests {
                 .cloned()
                 .collect::<HashSet<_>>();
 
-            remote.batch_fetch(
+            remote.remote.batch_fetch(
                 FetchContext::default(),
                 &objs,
                 |_, data| {
-                    assert!(is_redacted(&data));
+                    assert!(is_redacted(&data.into()));
                     Ok(())
                 },
                 |_, _| {},
@@ -2814,7 +2897,7 @@ mod tests {
             .collect::<HashSet<_>>();
         let out = Arc::new(Mutex::new(Vec::new()));
 
-        remote.batch_fetch(
+        remote.remote.batch_fetch(
             FetchContext::default(),
             &objs,
             {
@@ -2877,17 +2960,22 @@ mod tests {
             .collect::<HashSet<_>>();
         remote.batch_upload(
             &objs,
-            move |sha256, size| local_lfs.blobs.get(&sha256, size),
+            move |sha256, size| {
+                local_lfs
+                    .blobs
+                    .get(&sha256, size)
+                    .map(|r| r.map(|b| b.into_bytes()))
+            },
             |_, _| {},
         )?;
 
         assert_eq!(
             remote_lfs_file_store.get(&blob1.0, blob1.1 as u64)?,
-            Some(blob1.2)
+            Some(blob1.2.into())
         );
         assert_eq!(
             remote_lfs_file_store.get(&blob2.0, blob2.1 as u64)?,
-            Some(blob2.2)
+            Some(blob2.2.into())
         );
 
         Ok(())
@@ -2906,13 +2994,9 @@ mod tests {
         let local_lfs = Arc::new(LfsStore::permanent(&lfsdir, &config)?);
 
         let k1 = key("a", "2");
-        let delta = Delta {
-            data: Bytes::from("THIS IS A LARGE BLOB"),
-            base: None,
-            key: k1.clone(),
-        };
+        let data = Bytes::from("THIS IS A LARGE BLOB");
 
-        local_lfs.add(&delta, &Default::default())?;
+        local_lfs.add_blob_and_pointer(k1.clone(), data.clone())?;
 
         let remote_dir = TempDir::new()?;
         let url = Url::from_file_path(&remote_dir).unwrap();
@@ -2923,15 +3007,14 @@ mod tests {
             Some(local_lfs.clone()),
             &config,
         )?);
-        let remote = remote.datastore(shared_lfs.clone());
         let k = StoreKey::hgid(k1.clone());
         remote.upload(&[k.clone()])?;
 
-        let contentk = StoreKey::Content(ContentHash::sha256(&delta.data), Some(k1));
+        let contentk = StoreKey::Content(ContentHash::sha256(&data), Some(k1));
 
         // The blob was moved from the local store to the shared store.
-        assert_eq!(local_lfs.get(k.clone())?, StoreResult::NotFound(contentk));
-        assert_eq!(shared_lfs.get(k)?, StoreResult::Found(delta.data.to_vec()));
+        assert_eq!(local_lfs.blob(k.clone())?, StoreResult::NotFound(contentk));
+        assert_eq!(shared_lfs.blob(k)?, StoreResult::Found(data));
 
         Ok(())
     }
@@ -2945,16 +3028,11 @@ mod tests {
 
         let data = Bytes::from(&[1, 2, 3, 4][..]);
         let k1 = key("a", "2");
-        let delta = Delta {
-            data,
-            base: None,
-            key: k1.clone(),
-        };
 
-        store.add(&delta, &Default::default())?;
+        store.add_blob_and_pointer(k1.clone(), data.clone())?;
 
         let blob = store.blob(StoreKey::from(k1))?;
-        assert_eq!(blob, StoreResult::Found(delta.data));
+        assert_eq!(blob, StoreResult::Found(data));
 
         Ok(())
     }
@@ -2969,13 +3047,8 @@ mod tests {
         let k1 = key("a", "2");
         let data = Bytes::from(&[1, 2, 3, 4][..]);
         let hash = ContentHash::sha256(&data);
-        let delta = Delta {
-            data,
-            base: None,
-            key: k1.clone(),
-        };
 
-        store.add(&delta, &Default::default())?;
+        store.add_blob_and_pointer(k1.clone(), data)?;
 
         let metadata = store.metadata(StoreKey::from(k1))?;
         assert_eq!(
@@ -2986,29 +3059,6 @@ mod tests {
                 hash,
             })
         );
-
-        Ok(())
-    }
-
-    #[test]
-    fn test_lfs_skips_server_for_empty_batch() -> Result<()> {
-        let cachedir = TempDir::new()?;
-        let lfsdir = TempDir::new()?;
-        let server = mockito::Server::new();
-        let mut config =
-            make_lfs_config(&server, &cachedir, "test_lfs_skips_server_for_empty_batch");
-
-        let store = Arc::new(LfsStore::permanent(&lfsdir, &config)?);
-
-        // 192.0.2.0 won't be routable, since that's TEST-NET-1. This test will fail if we attempt
-        // to connect.
-        setconfig(&mut config, "lfs", "url", "http://192.0.2.0/");
-
-        let lfs = Arc::new(LfsStore::rotated(&lfsdir, &config)?);
-        let remote = Arc::new(LfsClient::new(lfs, None, &config)?);
-
-        let resp = remote.datastore(store).prefetch(&[]);
-        assert!(resp.is_ok());
 
         Ok(())
     }
@@ -3088,7 +3138,7 @@ mod tests {
             // Make sure we get an error (but don't panic).
             assert!(
                 remote
-                    .batch_fetch(FetchContext::default(), &objs, |_, _| Ok(()), |_, _| {})
+                    .batch_fetch(FetchContext::default(), &objs, |_| (), |_, _| {})
                     .is_err()
             );
 
@@ -3102,6 +3152,171 @@ mod tests {
         test_with_config("")?;
         test_with_config("0")?;
         test_with_config("0,0,0")?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_streaming_inserter() -> Result<()> {
+        let dir = TempDir::new()?;
+        let config = BTreeMap::<&str, &str>::new();
+
+        let store =
+            LfsBlobsStore::IndexedLog(LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?);
+
+        let data = Bytes::from_static(b"abc");
+        let expected_hash = ContentHash::sha256(&data).unwrap_sha256();
+
+        {
+            // Incomplete write
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.slice(0..1))?;
+            inserter.add_chunk(data.slice(1..2))?;
+            assert!(inserter.finish().is_err());
+            assert!(store.get(&expected_hash, data.len() as u64)?.is_none());
+        }
+
+        {
+            // Corrupted data
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.slice(0..1))?;
+            inserter.add_chunk(data.slice(1..2))?;
+            assert!(inserter.add_chunk(Bytes::from_static(b"z")).is_err());
+            assert!(inserter.finish().is_err());
+            assert!(store.get(&expected_hash, data.len() as u64)?.is_none());
+        }
+
+        {
+            // Good
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.slice(0..1))?;
+            inserter.add_chunk(data.slice(1..2))?;
+            inserter.add_chunk(data.slice(2..3))?;
+            assert!(inserter.finish().is_ok());
+            assert_eq!(
+                store.get(&expected_hash, data.len() as u64)?.unwrap(),
+                data.clone().into()
+            );
+        }
+
+        {
+            // Insert in a single chunk
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.clone())?;
+            assert!(inserter.finish().is_ok());
+            assert_eq!(
+                store.get(&expected_hash, data.len() as u64)?.unwrap(),
+                data.clone().into()
+            );
+        }
+
+        {
+            // Multiple storage chunks.
+            let mut idl_store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
+            idl_store.chunk_size = 2;
+            let store = LfsBlobsStore::IndexedLog(idl_store);
+
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.slice(0..1))?;
+            inserter.add_chunk(data.slice(1..2))?;
+            inserter.add_chunk(data.slice(2..3))?;
+            assert!(inserter.finish().is_ok());
+            assert_eq!(
+                store.get(&expected_hash, data.len() as u64)?.unwrap(),
+                data.clone().into()
+            );
+        }
+
+        {
+            // Multiple owned storage chunks.
+            let mut idl_store = LfsIndexedLogBlobsStore::rotated(dir.path(), &config)?;
+            idl_store.chunk_size = 2;
+            let store = LfsBlobsStore::IndexedLog(idl_store);
+
+            let mut inserter = StreamingInserter::new(&store, expected_hash, data.len() as u64)?;
+            inserter.add_chunk(data.slice(0..1).to_vec().into())?;
+            inserter.add_chunk(data.slice(1..2).to_vec().into())?;
+            inserter.add_chunk(data.slice(2..3).to_vec().into())?;
+            assert!(inserter.finish().is_ok());
+            assert_eq!(
+                store.get(&expected_hash, data.len() as u64)?.unwrap(),
+                data.clone().into()
+            );
+        }
+
+        {
+            // Stream to in-memory buffer
+            let mut inserter = StreamingInserter::memory(expected_hash, data.len() as u64);
+            inserter.add_chunk(data.clone())?;
+
+            let state = inserter.finish()?.1;
+            match state {
+                StreamingState::Memory(buf) => assert_eq!(buf, data.as_ref()),
+                _ => panic!("bad state"),
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_limited_buffer_pool() -> Result<()> {
+        let mut pool = LimitedBufferPool::new(2);
+
+        // So buffers are cleared instantly on pool.gc().
+        pool.gc_timeout = Duration::ZERO;
+
+        let (handle1, mut buf1) = pool.get().await;
+        assert!(buf1.is_empty());
+
+        let (handle2, buf2) = pool.get().await;
+        assert!(buf2.is_empty());
+
+        // Pool empty.
+        assert!(pool.get().now_or_never().is_none());
+
+        // Use buf2 and then put back.
+        buf1.extend_from_slice(b"hello");
+        handle1.put(buf1);
+
+        // Now we can get buf1 back.
+        let (handle1, buf1) = pool.get().await;
+        assert!(buf1.is_empty());
+        assert!(buf1.capacity() >= b"hello".len());
+
+        // Oops - forgot to put back buf2.
+        drop(handle2);
+
+        // That's okay - a spot was still freed up.
+        let (handle2, buf2) = pool.get().await;
+        assert!(buf2.is_empty());
+
+        drop(handle1);
+        drop(handle2);
+
+        // Put an allocated buffer back.
+        let (handle1, mut buf1) = pool.get().await;
+        buf1.reserve(100);
+        handle1.put(buf1);
+
+        // Take the empty buffer.
+        let (_handle2, _buf2) = pool.get().await;
+        assert_eq!(buf2.capacity(), 0);
+
+        // Sanity check pool has one item in it.
+        assert_eq!(pool.rx.capacity(), Some(2));
+        assert_eq!(pool.rx.len(), 1);
+
+        // Run gc.
+        pool.gc();
+
+        // Pool has same amount of items after gc.
+        assert_eq!(pool.rx.capacity(), Some(2));
+        assert_eq!(pool.rx.len(), 1);
+
+        // Our allocated buffer is now empty.
+        let (_handle1, buf1) = pool.get().await;
+        assert_eq!(buf1.capacity(), 0);
 
         Ok(())
     }

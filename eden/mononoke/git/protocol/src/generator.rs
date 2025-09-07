@@ -12,6 +12,8 @@ use std::task::Poll;
 use anyhow::Context;
 use anyhow::Ok;
 use anyhow::Result;
+use buffered_weighted::FutureWithWeight;
+use buffered_weighted::GlobalWeight;
 use buffered_weighted::MemoryBound;
 use cloned::cloned;
 use commit_graph_types::frontier::AncestorsWithinDistance;
@@ -33,7 +35,6 @@ use gix_hash::ObjectId;
 use manifest::ManifestOps;
 use mononoke_types::ChangesetId;
 use mononoke_types::hash::GitSha1;
-use mononoke_types::path::MPath;
 use rustc_hash::FxHashSet;
 use scuba_ext::FutureStatsScubaExt;
 use scuba_ext::MononokeScubaSampleBuilder;
@@ -77,6 +78,8 @@ use crate::utils::tag_entries_to_hashes;
 use crate::utils::to_commit_stream;
 use crate::utils::to_git_object_stream;
 
+const DEFAULT_GIT_GENERATOR_BUFFER_BYTES: usize = 104_857_600; // 100 MB
+
 /// Fetch and collect the tree and blob objects that are expressed as full objects
 /// for the boundary commits of a shallow fetch
 async fn boundary_trees_and_blobs(
@@ -95,52 +98,42 @@ async fn boundary_trees_and_blobs(
         None => Vec::new(),
     };
     stream::iter(boundary_commits.into_iter().map(|entry| Ok((entry.csid(), entry.oid()))))
-        .map_ok(|(changeset_id, git_commit_id)| {
-            cloned!(ctx, blobstore, filter);
-            async move {
-                let root_tree = fetch_non_blob_git_object(&ctx, &blobstore, &git_commit_id)
-                    .await
-                    .context("Error in fetching boundary commit")?
-                    .with_parsed_as_commit(|commit| GitTreeId(commit.tree()))
-                    .ok_or_else(|| anyhow::anyhow!("Git object {:?} is not a commit", git_commit_id))?;
-                let objects = root_tree.list_all_entries((*ctx).clone(), blobstore.clone()).try_collect::<Vec<_>>().await?;
-                let objects = stream::iter(objects).map(|(path, entry)| {
-                    cloned!(ctx, blobstore, filter);
-                    async move {
-                        let filter = Arc::unwrap_or_clone(filter);
-                        // If the entry is a submodule OR if the request has no filter or doesn't care about size, then let's assume size as 0
-                        let size = if entry.is_submodule() || filter.is_none_or(|filter| filter.no_size_constraint()) {
-                            0
-                        } else {
-                            entry.size(&ctx, &blobstore).await?
-                        };
-                        Ok((path, entry, size))
-                    }
-                })
-                .buffer_unordered(concurrency.trees_and_blobs)
-                .try_filter_map(|(path, entry, size)|{
-                    cloned!(filter);
-                    async move {
-                        let kind = entry.kind();
-                        let oid = entry.oid();
-                        // If the entry corresponds to a submodules (and shows up as a commit), then we ignore it
-                        // If the object is ignored by the filter, then we ignore it
-                        if !filter_object(filter, &path, kind, size) || entry.is_submodule() {
-                            Ok(None)
-                        } else {
-                            Ok(Some(FullObjectEntry::new(changeset_id, path, oid, size, kind)))
-                        }
-                    }
-                })
-                .try_collect::<FxHashSet<_>>()
+        .map_ok(async |(changeset_id, git_commit_id)| {
+            let root_tree = fetch_non_blob_git_object(&ctx, &blobstore, &git_commit_id)
                 .await
-                .with_context(|| {
-                    format!(
-                        "Error while listing all entries from GitTree for changeset {changeset_id:?} and root tree {root_tree:?}",
-                    )
-                })?;
-                Ok(objects)
-            }
+                .context("Error in fetching boundary commit")?
+                .with_parsed_as_commit(|commit| GitTreeId(commit.tree()))
+                .ok_or_else(|| anyhow::anyhow!("Git object {:?} is not a commit", git_commit_id))?;
+            let objects = root_tree.list_all_entries((*ctx).clone(), blobstore.clone()).try_collect::<Vec<_>>().await?;
+            let objects = stream::iter(objects).map(async |(path, entry)| {
+                // If the entry is a submodule OR if the request has no filter or doesn't care about size, then let's assume size as 0
+                let size = if entry.is_submodule() || filter.as_ref().as_ref().is_none_or(|filter| filter.no_size_constraint()) {
+                    0
+                } else {
+                    entry.size(&ctx, &blobstore).await?
+                };
+                Ok((path, entry, size))
+            })
+            .buffer_unordered(concurrency.trees_and_blobs)
+            .try_filter_map(async |(path, entry, size)| {
+                let kind = entry.kind();
+                let oid = entry.oid();
+                // If the entry corresponds to a submodules (and shows up as a commit), then we ignore it
+                // If the object is ignored by the filter, then we ignore it
+                if !filter_object(filter.clone(), &path, kind, size) || entry.is_submodule() {
+                    Ok(None)
+                } else {
+                    Ok(Some(FullObjectEntry::new(changeset_id, path, oid, size, kind)))
+                }
+            })
+            .try_collect::<FxHashSet<_>>()
+            .await
+            .with_context(|| {
+                format!(
+                    "Error while listing all entries from GitTree for changeset {changeset_id:?} and root tree {root_tree:?}",
+                )
+            })?;
+            Ok(objects)
         })
         .try_buffered(concurrency.shallow)
         .try_concat()
@@ -180,52 +173,46 @@ async fn trees_and_blobs_count(
     });
     // Sum up the entries in the delta manifest for each commit included in packfile
     let body_stream = target_commits
-        .map_ok(|changeset_id| {
-            cloned!(ctx, derived_data, blobstore, filter);
-            async move {
-                let delta_manifest = fetch_git_delta_manifest(
-                    &ctx,
-                    &derived_data,
-                    &blobstore,
-                    git_delta_manifest_version,
-                    changeset_id,
-                )
-                .await?;
-                // Get the FxHashSet of the tree and blob object Ids that will be included
-                // in the packfile
-                let objects = delta_manifest
-                    .into_entries(&ctx, &blobstore.boxed())
-                    .try_filter_map(|(path, entry)| {
-                        cloned!(filter);
-                        async move {
-                            let (kind, size) = (entry.full_object_kind(), entry.full_object_size());
-                            // If the entry does not pass the filter, then it should not be included in the count
-                            if !filter_object(filter.clone(), &path, kind, size) {
-                                return Ok(None);
-                            }
-                            let delta = delta_base(
-                                entry.as_ref(),
-                                delta_inclusion,
-                                filter,
-                                chain_breaking_mode,
-                            );
-                            let output = (
-                                entry.full_object_oid(),
-                                delta.map(|delta| delta.base_object_oid()),
-                            );
-                            Ok(Some(output))
-                        }
-                    })
-                    .try_collect::<Vec<_>>()
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "Error while listing entries from GitDeltaManifest for changeset {:?}",
-                            changeset_id,
-                        )
-                    })?;
-                Ok(objects)
-            }
+        .map_ok(async |changeset_id| {
+            let delta_manifest = fetch_git_delta_manifest(
+                &ctx,
+                &derived_data,
+                &blobstore,
+                git_delta_manifest_version,
+                changeset_id,
+            )
+            .await?;
+            // Get the FxHashSet of the tree and blob object Ids that will be included
+            // in the packfile
+            let objects = delta_manifest
+                .into_entries(&ctx, &blobstore.boxed())
+                .try_filter_map(async |entry| {
+                    let (kind, size) = (entry.full_object_kind(), entry.full_object_size());
+                    // If the entry does not pass the filter, then it should not be included in the count
+                    if !filter_object(filter.clone(), entry.path(), kind, size) {
+                        return Ok(None);
+                    }
+                    let delta = delta_base(
+                        entry.as_ref(),
+                        delta_inclusion,
+                        filter.clone(),
+                        chain_breaking_mode,
+                    );
+                    let output = (
+                        entry.full_object_oid(),
+                        delta.map(|delta| delta.base_object_oid()),
+                    );
+                    Ok(Some(output))
+                })
+                .try_collect::<Vec<_>>()
+                .await
+                .with_context(|| {
+                    format!(
+                        "Error while listing entries from GitDeltaManifest for changeset {:?}",
+                        changeset_id,
+                    )
+                })?;
+            Ok(objects)
         })
         .try_buffered(concurrency.trees_and_blobs);
     let object_set = explicitly_requested_objects
@@ -235,7 +222,7 @@ async fn trees_and_blobs_count(
         .chain(body_stream)
         .try_fold(
             (object_set, FxHashSet::default()),
-            |(mut object_set, mut base_set), objects_with_bases| async move {
+            async |(mut object_set, mut base_set), objects_with_bases| {
                 for (object, base) in objects_with_bases {
                     // If the object is already used as a base, then it should NOT be
                     // part of the packfile
@@ -259,9 +246,7 @@ async fn trees_and_blobs_count(
 
 async fn boundary_stream(
     fetch_container: FetchContainer,
-) -> Result<
-    BoxStream<'static, Result<(ChangesetId, MPath, Box<dyn GitDeltaManifestEntryOps + Send>)>>,
-> {
+) -> Result<BoxStream<'static, Result<(ChangesetId, Box<dyn GitDeltaManifestEntryOps + Send>)>>> {
     let objects = boundary_trees_and_blobs(fetch_container)
         .await?
         .into_iter()
@@ -269,8 +254,8 @@ async fn boundary_stream(
             let cs_id = full_entry.cs_id;
             let path = full_entry.path.clone();
             let delta_manifest_entry: Box<dyn GitDeltaManifestEntryOps + Send> =
-                Box::new(full_entry.into_delta_manifest_entry());
-            Ok((cs_id, path, delta_manifest_entry))
+                Box::new((path, full_entry.into_delta_manifest_entry()));
+            Ok((cs_id, delta_manifest_entry))
         });
     Ok(stream::iter(objects).boxed())
 }
@@ -308,6 +293,9 @@ fn packfile_stream_from_changesets<'a>(
     let mut delta_manifest_entries_buffer = VecDeque::new();
     let mut delta_manifest_entries_futures = FuturesOrdered::new();
     let mut packfile_items_futures = FuturesOrdered::new();
+    let max_buffer = justknobs::get_as::<usize>("scm/mononoke:git_generator_buffer_bytes", None)
+        .unwrap_or(DEFAULT_GIT_GENERATOR_BUFFER_BYTES);
+    let mut buffer_weight = GlobalWeight::new(max_buffer); // ~100 MB
 
     stream::poll_fn(move |cx| {
         if cs_ids.is_empty()
@@ -319,7 +307,7 @@ fn packfile_stream_from_changesets<'a>(
         }
 
         while delta_manifest_entries_futures.len() + delta_manifest_entries_buffer.len()
-            < 2 * concurrency.trees_and_blobs
+            < concurrency.trees_and_blobs
         {
             if let Some(cs_id) = cs_ids.pop_front() {
                 delta_manifest_entries_futures.push_back(changeset_delta_manifest_entries(
@@ -348,31 +336,41 @@ fn packfile_stream_from_changesets<'a>(
             }
         }
 
-        while packfile_items_futures.len() < concurrency.trees_and_blobs {
-            if let Some((_, _, entry)) = delta_manifest_entries_buffer.front() {
-                // If the next future will tip memory usage over the memory bound then don't start polling it,
-                // unless `packfile_items_futures` is empty in which case we add the future regardless to make
-                // sure we always make progress.
-                if !packfile_items_futures.is_empty()
-                    && !MemoryBound::new(Some(concurrency.memory_bound)).within_bound(entry_weight(
+        loop {
+            if let Some((_, entry)) = delta_manifest_entries_buffer.front() {
+                // If `packfile_items_futures` is empty, then we have to poll the next item regardless of the current memory usage to
+                // ensure that the stream makes progress
+                if !packfile_items_futures.is_empty() {
+                    let weight = entry_weight(
                         entry.as_ref(),
                         delta_inclusion,
                         filter.clone(),
                         chain_breaking_mode,
-                    ))
-                {
-                    break;
+                    );
+                    // If the next future will tip memory usage over the memory bound OR if we don't have enough buffer budget for it,
+                    // then don't start polling it
+                    if !buffer_weight.has_space_for(weight)
+                        || !MemoryBound::new(Some(concurrency.memory_bound)).within_bound(weight)
+                    {
+                        break;
+                    }
                 }
             }
 
-            if let Some((cs_id, path, entry)) = delta_manifest_entries_buffer.pop_front() {
-                packfile_items_futures.push_back(packfile_item_for_delta_manifest_entry(
+            if let Some((_cs_id, entry)) = delta_manifest_entries_buffer.pop_front() {
+                let weight = entry_weight(
+                    entry.as_ref(),
+                    delta_inclusion,
+                    filter.clone(),
+                    chain_breaking_mode,
+                );
+                buffer_weight.add_weight(weight);
+                let fut = packfile_item_for_delta_manifest_entry(
                     fetch_container.clone(),
                     base_set.clone(),
-                    cs_id,
-                    path,
                     entry,
-                ));
+                );
+                packfile_items_futures.push_back(FutureWithWeight::new(weight, fut));
             } else {
                 break;
             }
@@ -384,7 +382,14 @@ fn packfile_stream_from_changesets<'a>(
             cx.waker().wake_by_ref();
             Poll::Pending
         } else {
-            packfile_items_futures.poll_next_unpin(cx)
+            match packfile_items_futures.poll_next_unpin(cx) {
+                Poll::Ready(Some((weight, output))) => {
+                    buffer_weight.sub_weight(weight);
+                    Poll::Ready(Some(output))
+                }
+                Poll::Ready(None) => Poll::Ready(None),
+                Poll::Pending => Poll::Pending,
+            }
         }
     })
     .try_filter_map(futures::future::ok)
@@ -413,17 +418,10 @@ async fn tree_and_blob_packfile_stream<'a>(
         .await?
         .map_ok({
             cloned!(fetch_container, base_set);
-            move |(changeset_id, path, entry)| {
+            move |(_changeset_id, entry)| {
                 cloned!(fetch_container, base_set);
                 async move {
-                    packfile_item_for_delta_manifest_entry(
-                        fetch_container,
-                        base_set,
-                        changeset_id,
-                        path,
-                        entry,
-                    )
-                    .await
+                    packfile_item_for_delta_manifest_entry(fetch_container, base_set, entry).await
                 }
             }
         })
@@ -549,7 +547,7 @@ async fn tag_packfile_stream<'a>(
     // Since we need the count of items, we would have to consume the stream either for counting or collecting the items.
     // This is fine, since unlike commits, blobs and trees there will only be thousands of tags in the worst case.
     let annotated_tags = stream::iter(bookmarks.entries.keys())
-        .filter_map(|bookmark| async move {
+        .filter_map(async |bookmark| {
             // If the bookmark is actually a tag but there is no mapping in bonsai_tag_mapping table for it, then it
             // means that its a simple tag and won't be included in the packfile as an object. If a mapping exists, then
             // it will be included in the packfile as a raw Git
@@ -593,6 +591,7 @@ async fn tags_packfile_stream<'a>(
     repo: &'a impl Repo,
     requested_commits: Vec<ChangesetId>,
     requested_tag_names: Arc<FxHashSet<String>>,
+    refs_source: RefsSource,
 ) -> Result<(BoxStream<'a, Result<PackfileItem>>, usize)> {
     let (ctx, filter, blobstore, concurrency) = (
         fetch_container.ctx.clone(),
@@ -611,7 +610,7 @@ async fn tags_packfile_stream<'a>(
     // NOTE: Fun git trick. If the client says it doesn't want tags, then instead of excluding all tags (like regular systems)
     // we still send the tags that were explicitly part of the client's WANT request :)
     let required_tag_names = match include_tags {
-        true => list_tags(&ctx, repo, RefsSource::WarmBookmarksCache) // Use WBC for read path
+        true => list_tags(&ctx, repo, refs_source)
             .await
             .map(|entries| {
                 entries
@@ -928,6 +927,7 @@ pub async fn fetch_response<'a>(
         repo,
         target_commits,
         translated_sha_heads.tag_names.clone(),
+        request.refs_source,
     )
     .try_timed()
     .await

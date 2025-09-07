@@ -87,6 +87,7 @@
       "http_path": "/lfs1/objects/batch",
       "http_user_agent": "Sapling/*", (glob)
       "method": "batch",
+      "read_bookmarks_from_xdb_replica": "true",
       "repository": "lfs1",
       "request_id": "*", (glob)
       "sandcastle_alias": null,
@@ -94,7 +95,10 @@
       "sandcastle_vcs": null
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "use_maybe_stale_freshness_for_bookmarks": [
+        "mononoke_api::repo::git::get_bookmark_state"
+      ]
     }
   }
   {
@@ -151,6 +155,7 @@
       "http_query": "server_hostname=*", (glob)
       "http_user_agent": "Sapling/*", (glob)
       "method": "upload",
+      "read_bookmarks_from_xdb_replica": "true",
       "repository": "lfs1",
       "request_id": "*", (glob)
       "sandcastle_alias": null,
@@ -158,7 +163,10 @@
       "sandcastle_vcs": null
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "use_maybe_stale_freshness_for_bookmarks": [
+        "mononoke_api::repo::git::get_bookmark_state"
+      ]
     }
   }
   {
@@ -219,6 +227,7 @@
       "http_path": "/lfs1/objects/batch",
       "http_user_agent": "Sapling/*", (glob)
       "method": "batch",
+      "read_bookmarks_from_xdb_replica": "true",
       "repository": "lfs1",
       "request_id": "*", (glob)
       "sandcastle_alias": null,
@@ -227,7 +236,10 @@
     },
     "normvector": {
       "batch_internal_missing_blobs": [],
-      "client_identities": []
+      "client_identities": [],
+      "use_maybe_stale_freshness_for_bookmarks": [
+        "mononoke_api::repo::git::get_bookmark_state"
+      ]
     }
   }
   {
@@ -263,7 +275,7 @@
       "duration_ms": *, (glob)
       "error_count": 0,
       "headers_duration_ms": *, (glob)
-      "http_status": 200,
+      "http_status": 2*, (glob)
       "response_bytes_sent": 18,
       "seq": 0,
       "stream_completed": *, (glob)
@@ -289,6 +301,7 @@
       "http_query": "server_hostname=*", (glob)
       "http_user_agent": "Sapling/*", (glob)
       "method": "download",
+      "read_bookmarks_from_xdb_replica": "true",
       "repository": "lfs1",
       "request_id": "*", (glob)
       "response_content_encoding": "zstd",
@@ -297,7 +310,10 @@
       "sandcastle_vcs": null
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "use_maybe_stale_freshness_for_bookmarks": [
+        "mononoke_api::repo::git::get_bookmark_state"
+      ]
     }
   }
   {
@@ -346,13 +362,17 @@
       "http_path": "/config",
       "http_query": "foo=bar",
       "http_user_agent": "curl/*", (glob)
+      "read_bookmarks_from_xdb_replica": "true",
       "request_id": "*", (glob)
       "sandcastle_alias": null,
       "sandcastle_nonce": null,
       "sandcastle_vcs": null
     },
     "normvector": {
-      "client_identities": []
+      "client_identities": [],
+      "use_maybe_stale_freshness_for_bookmarks": [
+        "mononoke_api::repo::git::get_bookmark_state"
+      ]
     }
   }
 

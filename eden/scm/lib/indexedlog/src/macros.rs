@@ -7,7 +7,7 @@
 
 // Implement traits for typed offset structs.
 macro_rules! impl_offset {
-    ($type:ident, $type_int:expr_2021, $name:expr_2021) => {
+    ($type:ident, $type_int:expr, $name:expr) => {
         impl TypedOffsetMethods for $type {
             #[inline]
             fn type_int() -> u8 {
@@ -68,6 +68,16 @@ macro_rules! impl_offset {
             fn from(x: $type) -> usize {
                 (x.0).0 as usize
             }
+        }
+    };
+}
+
+// Fail point for tests only.
+macro_rules! test_only_fail_point {
+    ($condition: expr) => {
+        #[cfg(test)]
+        if $condition {
+            return Err(crate::Error::blank().message("injected failure"));
         }
     };
 }

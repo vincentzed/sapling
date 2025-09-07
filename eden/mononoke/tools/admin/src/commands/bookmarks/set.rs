@@ -73,7 +73,11 @@ pub async fn set(ctx: &CoreContext, repo: &Repo, set_args: BookmarksSetArgs) -> 
         Some(parse_commit_id(ctx, repo, old_commit_id).await?)
     } else {
         repo.bookmarks()
-            .get(ctx.clone(), &set_args.name)
+            .get(
+                ctx.clone(),
+                &set_args.name,
+                bookmarks::Freshness::MostRecent,
+            )
             .await
             .with_context(|| format!("Failed to resolve bookmark '{}'", set_args.name))?
     };

@@ -523,7 +523,10 @@ async fn get_bookmark_value(
     repo: &Arc<Repo>,
     bookmark: &BookmarkKey,
 ) -> Result<ChangesetId> {
-    let maybe_bookmark_value = repo.bookmarks().get(ctx.clone(), bookmark).await?;
+    let maybe_bookmark_value = repo
+        .bookmarks()
+        .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
+        .await?;
 
     maybe_bookmark_value.ok_or_else(|| {
         anyhow!(

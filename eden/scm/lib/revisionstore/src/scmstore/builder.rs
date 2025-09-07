@@ -54,8 +54,6 @@ pub struct FileStoreBuilder<'a> {
 
     indexedlog_local: Option<Arc<IndexedLogHgIdDataStore>>,
     indexedlog_cache: Option<Arc<IndexedLogHgIdDataStore>>,
-    lfs_local: Option<Arc<LfsStore>>,
-    lfs_cache: Option<Arc<LfsStore>>,
 
     edenapi: Option<Arc<SaplingRemoteApiFileStore>>,
     cas_client: Option<Arc<dyn CasClient>>,
@@ -71,8 +69,6 @@ impl<'a> FileStoreBuilder<'a> {
             override_edenapi: None,
             indexedlog_local: None,
             indexedlog_cache: None,
-            lfs_local: None,
-            lfs_cache: None,
             edenapi: None,
             cas_client: None,
             format: None,
@@ -111,16 +107,6 @@ impl<'a> FileStoreBuilder<'a> {
 
     pub fn indexedlog_local(mut self, indexedlog: Arc<IndexedLogHgIdDataStore>) -> Self {
         self.indexedlog_local = Some(indexedlog);
-        self
-    }
-
-    pub fn lfs_cache(mut self, lfs_cache: Arc<LfsStore>) -> Self {
-        self.lfs_cache = Some(lfs_cache);
-        self
-    }
-
-    pub fn lfs_local(mut self, lfs_local: Arc<LfsStore>) -> Self {
-        self.lfs_local = Some(lfs_local);
         self
     }
 
@@ -180,6 +166,9 @@ impl<'a> FileStoreBuilder<'a> {
                 max_log_count: None,
                 max_bytes_per_log: None,
                 max_bytes: None,
+                btrfs_compression: self
+                    .config
+                    .get_or_default("indexedlog", "data.btrfs-compression")?,
             };
             Some(Arc::new(IndexedLogHgIdDataStore::new(
                 self.config,
@@ -213,6 +202,9 @@ impl<'a> FileStoreBuilder<'a> {
             max_log_count,
             max_bytes_per_log,
             max_bytes,
+            btrfs_compression: self
+                .config
+                .get_or_default("indexedlog", "data.btrfs-compression")?,
         };
         Ok(Some(Arc::new(IndexedLogHgIdDataStore::new(
             self.config,
@@ -240,10 +232,6 @@ impl<'a> FileStoreBuilder<'a> {
 
     #[context("failed to build lfs local")]
     pub fn build_lfs_local(&self) -> Result<Option<Arc<LfsStore>>> {
-        if !self.use_lfs()? {
-            return Ok(None);
-        }
-
         Ok(if let Some(local_path) = self.local_path.clone() {
             let local_path = get_local_path(local_path, &self.suffix)?;
             Some(Arc::new(LfsStore::permanent(local_path, self.config)?))
@@ -254,10 +242,6 @@ impl<'a> FileStoreBuilder<'a> {
 
     #[context("failed to build lfs cache")]
     pub fn build_lfs_cache(&self) -> Result<Option<Arc<LfsStore>>> {
-        if !self.use_lfs()? {
-            return Ok(None);
-        }
-
         let cache_path = match get_cache_path(self.config, &self.suffix)? {
             Some(p) => p,
             None => return Ok(None),
@@ -294,37 +278,22 @@ impl<'a> FileStoreBuilder<'a> {
             self.build_indexedlog_cache()?
         };
 
-        tracing::trace!(target: "revisionstore::filestore", "processing lfs local");
-        let lfs_local = if let Some(lfs_local) = self.lfs_local.take() {
-            Some(lfs_local)
-        } else {
-            self.build_lfs_local()?
-        };
-
-        tracing::trace!(target: "revisionstore::filestore", "processing lfs cache");
-        let lfs_cache = if let Some(lfs_cache) = self.lfs_cache.take() {
-            Some(lfs_cache)
-        } else {
-            self.build_lfs_cache()?
-        };
-
         tracing::trace!(target: "revisionstore::filestore", "processing aux data");
         let aux_cache = self.build_aux_cache()?;
 
-        tracing::trace!(target: "revisionstore::filestore", "processing lfs remote");
-        let lfs_remote = if self.use_lfs()? {
-            if let Some(ref lfs_cache) = lfs_cache {
-                // TODO(meyer): Refactor upload functionality so we don't need to use LfsRemote with it's own references to the
-                // underlying stores.
-                Some(Arc::new(LfsClient::new(
-                    lfs_cache.clone(),
-                    lfs_local.clone(),
+        let lfs_client = if self.use_lfs()? {
+            if let Some(lfs_cache) = self.build_lfs_cache()? {
+                Some(LfsClient::new(
+                    lfs_cache,
+                    self.build_lfs_local()?,
                     self.config,
-                )?))
+                )?)
             } else {
+                tracing::trace!(target: "revisionstore::filestore", "disabling lfs - no cache available");
                 None
             }
         } else {
+            tracing::trace!(target: "revisionstore::filestore", "lfs not in use");
             None
         };
 
@@ -389,13 +358,10 @@ impl<'a> FileStoreBuilder<'a> {
             compute_aux_data,
 
             indexedlog_local,
-            lfs_local,
-
             indexedlog_cache,
-            lfs_cache,
 
             edenapi,
-            lfs_remote,
+            lfs_client,
             cas_client,
 
             activity_logger,
@@ -413,6 +379,10 @@ impl<'a> FileStoreBuilder<'a> {
             unbounded_queue: self
                 .config
                 .get_or_default("experimental", "unbounded-scmstore-queue")?,
+
+            lfs_buffer_in_memory: self
+                .config
+                .get_or_default("experimental", "lfs-buffer-in-memory")?,
         })
     }
 }
@@ -532,6 +502,9 @@ impl<'a> TreeStoreBuilder<'a> {
                 max_log_count: None,
                 max_bytes_per_log: None,
                 max_bytes: None,
+                btrfs_compression: self
+                    .config
+                    .get_or_default("indexedlog", "manifest.btrfs-compression")?,
             };
             Some(Arc::new(IndexedLogHgIdDataStore::new(
                 self.config,
@@ -565,6 +538,9 @@ impl<'a> TreeStoreBuilder<'a> {
             max_log_count,
             max_bytes_per_log,
             max_bytes,
+            btrfs_compression: self
+                .config
+                .get_or_default("indexedlog", "manifest.btrfs-compression")?,
         };
 
         Ok(Some(Arc::new(IndexedLogHgIdDataStore::new(

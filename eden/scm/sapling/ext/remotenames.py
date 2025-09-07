@@ -187,11 +187,6 @@ def _expull(orig, repo, remote, heads=None, force=False, **kwargs):
 
 
 def pullremotenames(repo, remote, bookmarks):
-    # when working between multiple local repos which do not all have
-    # remotenames enabled, do this work only for those with it enabled
-    if not hasattr(repo, "_remotenames"):
-        return
-
     path = activepath(repo.ui, remote)
     if path:
         # on a push, we don't want to keep obsolete heads since
@@ -889,7 +884,7 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
     edenapi = pushmod.get_edenapi_for_dest(repo, dest)
 
     is_scratch = False
-    if extensions.isenabled(ui, "commitcloud"):
+    if extensions.isenabled(ui, "commitcloud") and ccutil.is_supported(repo):
         bookname = opargs["to"] or opargs["delete"]
         scratchmatcher = ccutil.scratchbranchmatcher(ui)
         # infinitepush "scratch" branches don't work over the regular
@@ -1478,11 +1473,6 @@ def precachedistance(repo):
         precachedistance = False
         precachecurrent = False
     """
-    # when working between multiple local repos which do not all have
-    # remotenames enabled, do this work only for those with it enabled
-    if not hasattr(repo, "_remotenames"):
-        return
-
     # to avoid stale namespaces, let's reload
     repo._remotenames.clearnames()
 

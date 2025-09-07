@@ -5,9 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-use std::cmp;
 use std::marker::PhantomData;
-use std::mem;
 use std::pin::Pin;
 
 use futures::prelude::*;
@@ -39,26 +37,26 @@ const SMALL_BUFFER_SIZE: usize = 1024 * 8;
 /// efficiency since libcurl will typically return a stream of small packets.
 #[pin_project]
 #[must_use = "streams do nothing unless polled"]
-pub struct CborStream<T, S, B, E> {
+pub struct CborStream<T, S, E> {
     #[pin]
-    incoming: BufferedStream<S, B, E>,
+    incoming: S,
+    incoming_done: bool,
     buffer: Vec<u8>,
+    deserializing: minibytes::Bytes,
     threshold: usize,
     position: usize,
     terminated: bool,
-    _phantom: PhantomData<(T, B, E)>,
+    _phantom: PhantomData<(T, E)>,
 }
 
-impl<T, S, B, E> CborStream<T, S, B, E> {
+impl<T, S, E> CborStream<T, S, E> {
     pub(crate) fn new(body: S) -> Self {
-        Self::with_buffer_size(body, SMALL_BUFFER_SIZE)
-    }
-
-    pub(crate) fn with_buffer_size(body: S, size: usize) -> Self {
         Self {
-            incoming: BufferedStream::new(body, size),
+            incoming: body,
+            incoming_done: false,
             buffer: Vec::new(),
-            threshold: size,
+            deserializing: minibytes::Bytes::new(),
+            threshold: SMALL_BUFFER_SIZE,
             position: 0,
             terminated: false,
             _phantom: PhantomData,
@@ -66,11 +64,10 @@ impl<T, S, B, E> CborStream<T, S, B, E> {
     }
 }
 
-impl<T, S, B, E> Stream for CborStream<T, S, B, E>
+impl<T, S, E> Stream for CborStream<T, S, E>
 where
     T: DeserializeOwned,
-    S: Stream<Item = Result<B, E>> + Send + 'static,
-    B: AsRef<[u8]>,
+    S: Stream<Item = Result<Vec<u8>, E>> + Send + 'static,
     E: From<CborStreamError>,
 {
     type Item = Result<T, E>;
@@ -78,32 +75,64 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
-        if *this.terminated {
-            return Poll::Ready(None);
-        }
+        while !(*this.terminated
+            || *this.incoming_done
+                && *this.position == this.buffer.len().max(this.deserializing.len()))
+        {
+            if this.deserializing.is_empty() {
+                // Before we try deserializing, shuffle this.buffer to this.deserializing.
+                // This lets us use as_deserialize_hint() for zero copy Bytes deserializing.
+                *this.deserializing = std::mem::take(this.buffer).into();
+            }
 
-        loop {
+            let deserialized = this.deserializing.as_deserialize_hint(|| {
+                let mut de = Deserializer::from_slice(&this.deserializing[*this.position..]);
+                T::deserialize(&mut de).map(|t| (t, de.byte_offset()))
+            });
+
             // Attempt to deserialize a single item from the buffer.
-            let mut de = Deserializer::from_slice(&this.buffer[*this.position..]);
-            match T::deserialize(&mut de) {
-                Ok(value) => {
-                    *this.position += de.byte_offset();
-                    // Reset the buffer threshold in case we had expanded it to fit a large value.
-                    // If we indeed had to expand it, do not shrink it to smaller size than the MEDIUM_BUFFER_SIZE since
-                    // it could be traffic pattern rather than a single large item.
-                    if this.incoming.threshold() > (*this.threshold) {
-                        this.incoming
-                            .as_mut()
-                            .set_threshold(cmp::max(*this.threshold, MEDIUM_BUFFER_SIZE));
-                    }
+            match deserialized {
+                Ok((value, byte_offset)) => {
+                    *this.position += byte_offset;
+
+                    // Reset the buffer threshold in case we had expanded it to fit a very large
+                    // value. Do not shrink it to smaller size than MEDIUM_BUFFER_SIZE, lest
+                    // there is a traffic pattern rather than a single large item.
+                    *this.threshold = (*this.threshold).min(MEDIUM_BUFFER_SIZE);
+
                     return Poll::Ready(Some(Ok(value)));
                 }
                 Err(e) if !e.is_eof() => {
+                    // Got an error other than ran-out-of-bytes - end stream.
                     *this.terminated = true;
                     let e = CborStreamError::CborError(e);
                     return Poll::Ready(Some(Err(E::from(e))));
                 }
-                _ => {}
+                _ => {
+                    // We got EOF - we don't have enough data to deserialize the entire item.
+
+                    // Check if underlying stream is done.
+                    if *this.incoming_done {
+                        let e = CborStreamError::TrailingData(
+                            this.deserializing.len() - *this.position,
+                        );
+                        return Poll::Ready(Some(Err(E::from(e))));
+                    }
+
+                    match std::mem::take(this.deserializing).take_vec() {
+                        Ok(vec) => {
+                            // We recovered the buffer zero-copy - reuse the entire thing.
+                            *this.buffer = vec;
+                        }
+                        Err(bytes) => {
+                            // Couldn't recover the buffer (because T::deserialize retained a slice).
+                            // Copy unused part into a new buffer.
+                            *this.buffer = Vec::with_capacity(*this.threshold);
+                            this.buffer.extend_from_slice(&bytes[*this.position..]);
+                            *this.position = 0;
+                        }
+                    }
+                }
             }
 
             let pos = *this.position;
@@ -118,7 +147,7 @@ where
                 }
                 this.buffer.truncate(len);
                 *this.position = 0;
-            } else if this.buffer.len() >= this.incoming.threshold() {
+            } else if this.buffer.len() >= *this.threshold {
                 // If we get here, that means that we're attempting to deserialize a single value
                 // that is larger than the current buffer size. If the value is significantly larger
                 // than the current buffer size, this will result in accidentally quadratic behavior
@@ -130,93 +159,33 @@ where
                 // deserialization attempts for very large values.
                 //
                 // We will skip doubling small buffers, and go strait to 1MB buffer size.
-                let new_threshold = cmp::max(MEDIUM_BUFFER_SIZE, 2 * this.incoming.threshold());
-                this.incoming.as_mut().set_threshold(new_threshold);
+                *this.threshold = MEDIUM_BUFFER_SIZE.max(2 * *this.threshold);
             }
 
-            // Poll the underlying stream for more incoming data.
-            match ready!(this.incoming.as_mut().poll_next(cx)) {
-                Some(Ok(chunk)) => this.buffer.extend_from_slice(chunk.as_ref()),
-                Some(Err(e)) => {
-                    return Poll::Ready(Some(Err(e)));
-                }
-                None => {
-                    // At this point the stream is complete, so we expect to have read everything.
-                    // If we haven't, then something went wrong during the transfer and the data
-                    // we're handling seems corrupted: raise an error in that case.
-                    if !this.buffer.is_empty() {
-                        let e = CborStreamError::TrailingData(this.buffer.len());
-                        return Poll::Ready(Some(Err(E::from(e))));
+            // Poll the underlying stream for more incoming data, reading until we have self.threshold data.
+            while this.buffer.len() - *this.position < *this.threshold {
+                match ready!(this.incoming.as_mut().poll_next(cx)) {
+                    Some(Ok(chunk)) => {
+                        if this.buffer.is_empty() && this.buffer.capacity() < chunk.len() {
+                            // Optimize the fetching-single-item case to not copy the data. For
+                            // example, fetching a single tree/file will often come in via a single
+                            // data chunk from curl.
+                            *this.buffer = chunk;
+                        } else {
+                            this.buffer.extend_from_slice(&chunk);
+                        }
                     }
-                    return Poll::Ready(None);
-                }
-            }
-        }
-    }
-}
-
-/// A wrapper around a byte stream that buffers the data until it exceeds
-/// the given size threshold. This can improve the efficiency of processing
-/// data from bytes streams that consist largely of small chunks.
-#[pin_project]
-#[must_use = "streams do nothing unless polled"]
-pub struct BufferedStream<S, B, E> {
-    #[pin]
-    inner: S,
-    buffer: Vec<u8>,
-    threshold: usize,
-    done: bool,
-    _phantom: PhantomData<(B, E)>,
-}
-
-impl<S, B, E> BufferedStream<S, B, E> {
-    pub(crate) fn new(inner: S, n: usize) -> Self {
-        Self {
-            inner,
-            buffer: Vec::with_capacity(n),
-            threshold: n,
-            done: false,
-            _phantom: PhantomData,
-        }
-    }
-
-    fn threshold(&self) -> usize {
-        self.threshold
-    }
-
-    /// Update the buffer size in the middle of polling the stream.
-    fn set_threshold(self: Pin<&mut Self>, threshold: usize) {
-        *self.project().threshold = threshold;
-    }
-}
-
-impl<S, B, E> Stream for BufferedStream<S, B, E>
-where
-    S: Stream<Item = Result<B, E>> + Send + 'static,
-    B: AsRef<[u8]>,
-{
-    type Item = Result<Vec<u8>, E>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
-
-        if *this.done {
-            return Poll::Ready(None);
-        }
-
-        while this.buffer.len() < *this.threshold {
-            match ready!(this.inner.as_mut().poll_next(cx)) {
-                Some(Ok(bytes)) => this.buffer.extend_from_slice(bytes.as_ref()),
-                Some(Err(e)) => return Poll::Ready(Some(Err(e))),
-                None => {
-                    *this.done = true;
-                    break;
+                    Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+                    None => {
+                        // Underlying stream is done.
+                        *this.incoming_done = true;
+                        break;
+                    }
                 }
             }
         }
 
-        let buf = mem::replace(this.buffer, Vec::with_capacity(*this.threshold));
-        Poll::Ready(Some(Ok(buf)))
+        Poll::Ready(None)
     }
 }
 
@@ -381,39 +350,6 @@ mod tests {
             Err(CborStreamError::TrailingData(l)) if l == len => {}
             other => panic!("Unexpected result on trailing data: {:?}", other),
         };
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_buffered_stream() -> Result<()> {
-        let words: Vec<Result<Vec<u8>>> = vec![
-            Ok(b"The ".to_vec()),
-            Ok(b"quick ".to_vec()),
-            Ok(b"brown ".to_vec()),
-            Ok(b"fox ".to_vec()),
-            Ok(b"jumped ".to_vec()),
-            Ok(b"over ".to_vec()),
-            Ok(b"the ".to_vec()),
-            Ok(b"lazy ".to_vec()),
-            Ok(b"dog".to_vec()),
-        ];
-
-        let input = stream::iter(words);
-        let buf_size = 20;
-        let buffered = Box::pin(BufferedStream::new(input, buf_size));
-        let output = buffered.try_collect::<Vec<_>>().await?;
-
-        assert_eq!(output.len(), 3);
-
-        // Exactly 20 bytes long.
-        assert_eq!(&*output[0], &b"The quick brown fox "[..]);
-
-        // 21 bytes long because last chunk pushed buffer over limit.
-        assert_eq!(&*output[1], &b"jumped over the lazy "[..]);
-
-        // Short last item.
-        assert_eq!(&*output[2], &b"dog"[..]);
 
         Ok(())
     }

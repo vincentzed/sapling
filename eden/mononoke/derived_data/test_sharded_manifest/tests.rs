@@ -112,7 +112,11 @@ async fn test_for_fixture<F: TestRepoFixture + Send>(fb: FacebookInit) -> Result
     };
     if let Some(master_cs_id) = repo
         .bookmarks()
-        .get(ctx.clone(), &BookmarkKey::new("master").unwrap())
+        .get(
+            ctx.clone(),
+            &BookmarkKey::new("master").unwrap(),
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
     {
         futures::future::try_join3(

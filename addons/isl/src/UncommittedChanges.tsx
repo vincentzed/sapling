@@ -50,6 +50,7 @@ import {Row} from './ComponentUtils';
 import {FileTree, FileTreeFolderHeader} from './FileTree';
 import {useGeneratedFileStatuses} from './GeneratedFile';
 import {Internal} from './Internal';
+import {SmartActionsMenu} from './SmartActionsMenu';
 import {AbsorbButton} from './StackActions';
 import {confirmSuggestedEditsForFiles} from './SuggestedEdits';
 import {UnsavedFilesCount, confirmUnsavedFiles} from './UnsavedFiles';
@@ -92,7 +93,6 @@ import {latestHeadCommit, uncommittedChangesFetchError} from './serverAPIState';
 import {GeneratedStatus} from './types';
 
 import './UncommittedChanges.css';
-import {SmartActionsMenu} from './SmartActionsMenu';
 
 export type UIChangedFile = {
   path: RepoRelativePath;
@@ -957,6 +957,12 @@ function MergeConflictButtons({
         <Icon slot="start" icon={isRunningAbort ? 'loading' : 'circle-slash'} />
         <T>Abort</T>
       </Button>
+      {Internal.ResolveMergeConflictsWithAIButton ? (
+        <Internal.ResolveMergeConflictsWithAIButton
+          conflicts={conflicts}
+          disabled={allConflictsResolved || shouldDisableButtons}
+        />
+      ) : null}
       {externalMergeTool == null ? (
         platform.upsellExternalMergeTool ? (
           <Tooltip

@@ -522,11 +522,34 @@ impl SqlBookmarks {
         &self,
         ctx: CoreContext,
         key: &BookmarkKey,
+        freshness: Freshness,
     ) -> impl Future<Output = Result<Option<(ChangesetId, Option<u64>)>>> + 'static + use<> {
         STATS::get_bookmark.add_value(1);
-        ctx.perf_counters()
-            .increment_counter(PerfCounterType::SqlReadsMaster);
-        let conn = self.connections.read_master_connection.clone();
+
+        let client_correlator = ctx
+            .metadata()
+            .client_info()
+            .and_then(|ci| ci.request_info.as_ref().map(|cri| cri.correlator.as_str()));
+
+        // Callsites that don't require the most recent bookmark value should
+        // read from a replica. More context on D81212709.
+        let read_from_replica = justknobs::eval(
+            "scm/mononoke:read_bookmarks_from_xdb_replica",
+            client_correlator,
+            None,
+        )
+        .unwrap_or(false);
+
+        let conn = if read_from_replica && freshness == Freshness::MaybeStale {
+            ctx.perf_counters()
+                .increment_counter(PerfCounterType::SqlReadsReplica);
+            self.connections.read_connection.clone()
+        } else {
+            ctx.perf_counters()
+                .increment_counter(PerfCounterType::SqlReadsMaster);
+            self.connections.read_master_connection.clone()
+        };
+
         cloned!(self.repo_id, key);
         async move {
             let rows = SelectBookmark::query(
@@ -574,8 +597,9 @@ impl Bookmarks for SqlBookmarks {
         &self,
         ctx: CoreContext,
         name: &BookmarkKey,
+        freshness: Freshness,
     ) -> BoxFuture<'static, Result<Option<ChangesetId>>> {
-        self.get_raw(ctx, name)
+        self.get_raw(ctx, name, freshness)
             .map_ok(|maybe_row| maybe_row.map(|(cs_id, _log_id)| cs_id))
             .boxed()
     }

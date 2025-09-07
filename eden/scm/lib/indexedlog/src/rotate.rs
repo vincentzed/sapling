@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -29,6 +30,7 @@ use crate::errors::ResultExt;
 use crate::lock::READER_LOCK_OPTS;
 use crate::lock::ScopedDirLock;
 use crate::log;
+use crate::log::ExtendWrite;
 use crate::log::FlushFilterContext;
 use crate::log::FlushFilterFunc;
 use crate::log::FlushFilterOutput;
@@ -52,13 +54,24 @@ pub struct RotateLog {
     // Logical length of `logs`. It can be smaller than `logs.len()` if some Log
     // fails to load.
     logs_len: AtomicUsize,
+    // Rotated logs we hold on to in "consistent read" mode to provide temporary read-after-write
+    // consistency.
+    pinned_logs: Vec<Log>,
     latest: u8,
     // Indicate an active reader. Destrictive writes (repair) are unsafe.
     reader_lock: Option<ScopedDirLock>,
     change_detector: Option<SharedChangeDetector>,
+
+    // At what apparent file size we should check the btrfs "physical" size when checking if we
+    // should rotate. This is to minimize checks of the btrfs size.
+    next_btrfs_size_check: Option<u64>,
+
     // Run after log.sync(). For testing purpose only.
     #[cfg(test)]
     hook_after_log_sync: Option<Box<dyn Fn()>>,
+
+    // Count of active "with_consistent_reads()" calls.
+    consistent_reads: Arc<AtomicU64>,
 }
 
 // On disk, a RotateLog is a directory containing:
@@ -114,6 +127,12 @@ impl OpenOptions {
         self
     }
 
+    /// Set `fysnc` open for underlying [`Log`] objects.
+    pub fn fsync(mut self, fsync: bool) -> Self {
+        self.log_open_options = self.log_open_options.fsync(fsync);
+        self
+    }
+
     /// Sets the checksum type.
     ///
     /// See [log::ChecksumType] for details.
@@ -160,6 +179,13 @@ impl OpenOptions {
     /// This is useful to make in-memory buffer size bounded.
     pub fn auto_sync_threshold(mut self, threshold: impl Into<Option<u64>>) -> Self {
         self.auto_sync_threshold = threshold.into();
+        self
+    }
+
+    /// Enable btrfs aware mode where we rotate based on "physical" file size instead of apparent
+    /// file size to account for transparent btrfs compression.
+    pub fn btrfs_compression(mut self, btrfs: bool) -> Self {
+        self.log_open_options = self.log_open_options.btrfs_compression(btrfs);
         self
     }
 
@@ -243,11 +269,14 @@ impl OpenOptions {
                 open_options: self.clone(),
                 logs,
                 logs_len,
+                pinned_logs: Vec::new(),
                 latest,
                 reader_lock: Some(reader_lock),
                 change_detector: Some(change_detector),
+                next_btrfs_size_check: None,
                 #[cfg(test)]
                 hook_after_log_sync: None,
+                consistent_reads: Default::default(),
             };
             rotate_log.update_change_detector_to_match_meta();
             Ok(rotate_log)
@@ -268,11 +297,14 @@ impl OpenOptions {
                 open_options: self.clone(),
                 logs,
                 logs_len,
+                pinned_logs: Vec::new(),
                 latest: 0,
                 reader_lock: None,
                 change_detector: None,
+                next_btrfs_size_check: None,
                 #[cfg(test)]
                 hook_after_log_sync: None,
+                consistent_reads: Default::default(),
             })
         })();
         result.context("in rotate::OpenOptions::create_in_memory")
@@ -362,10 +394,40 @@ impl fmt::Debug for OpenOptions {
 impl RotateLog {
     /// Append data to the writable [`Log`].
     pub fn append(&mut self, data: impl AsRef<[u8]>) -> crate::Result<()> {
+        self.append_internal(
+            |buf| {
+                buf.extend_from_slice(data.as_ref());
+                crate::Result::Ok(())
+            },
+            Some(data.as_ref().len()),
+        )
+    }
+
+    /// Append data directly to the writable [`Log`]'s in-memory buffer.
+    pub fn append_direct<E>(
+        &mut self,
+        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
+    ) -> crate::Result<()>
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        self.append_internal(cb, None)
+    }
+
+    fn append_internal<E>(
+        &mut self,
+        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
+        data_len: Option<usize>,
+    ) -> crate::Result<()>
+    where
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        self.maybe_clear_pinned_logs();
+
         (|| -> crate::Result<_> {
             let threshold = self.open_options.auto_sync_threshold;
             let log = self.writable_log();
-            log.append(data)?;
+            log.append_internal(cb, data_len)?;
             if let Some(threshold) = threshold {
                 if log.mem_buf.len() as u64 >= threshold {
                     self.sync()
@@ -383,7 +445,7 @@ impl RotateLog {
         &self,
         index_id: usize,
         key: impl Into<Bytes>,
-    ) -> crate::Result<RotateLogLookupIter> {
+    ) -> crate::Result<RotateLogLookupIter<'_>> {
         let key = key.into();
         let result: crate::Result<_> = (|| {
             Ok(RotateLogLookupIter {
@@ -393,6 +455,11 @@ impl RotateLog {
                 log_index: 0,
                 index_id,
                 key: key.clone(),
+                pinned_logs: if self.is_consistent_reads() {
+                    &self.pinned_logs
+                } else {
+                    &[]
+                },
             })
         })();
         result
@@ -430,7 +497,7 @@ impl RotateLog {
         &self,
         index_id: usize,
         key: impl AsRef<[u8]>,
-    ) -> crate::Result<log::LogLookupIter> {
+    ) -> crate::Result<log::LogLookupIter<'_>> {
         let key = key.as_ref();
         assert!(
             self.open_options.log_open_options.flush_filter.is_some(),
@@ -450,6 +517,8 @@ impl RotateLog {
     ///
     /// For in-memory [`RotateLog`], this function always returns 0.
     pub fn sync(&mut self) -> crate::Result<u8> {
+        self.maybe_clear_pinned_logs();
+
         let result: crate::Result<_> = (|| {
             let span = debug_span!("RotateLog::sync", latest = self.latest as u32);
             if let Some(dir) = &self.dir {
@@ -468,12 +537,10 @@ impl RotateLog {
                         if latest != self.latest {
                             // Latest changed. Re-load and write to the real latest Log.
                             // PERF(minor): This can be smarter by avoiding reloading some logs.
-                            self.set_logs(read_logs(
-                                self.dir.as_ref().unwrap(),
-                                &self.open_options,
+                            self.set_logs(
                                 latest,
-                            )?);
-                            self.latest = latest;
+                                read_logs(self.dir.as_ref().unwrap(), &self.open_options, latest)?,
+                            );
                         }
                         self.writable_log().sync()?;
                     }
@@ -496,7 +563,6 @@ impl RotateLog {
                     // This is needed because RotateLog assumes non-latest logs
                     // are read-only. Other processes using RotateLog won't reload
                     // non-latest logs automatically.
-
                     // PERF(minor): This can be smarter by avoiding reloading some logs.
                     let mut new_logs =
                         read_logs(self.dir.as_ref().unwrap(), &self.open_options, latest)?;
@@ -521,8 +587,7 @@ impl RotateLog {
                             log.append(bytes)?;
                         }
                     }
-                    self.set_logs(new_logs);
-                    self.latest = latest;
+                    self.set_logs(latest, new_logs);
                 }
 
                 let size = self.writable_log().flush()?;
@@ -532,7 +597,13 @@ impl RotateLog {
                     func();
                 }
 
-                if size >= self.open_options.max_bytes_per_log {
+                let needs_rotation = if self.open_options.log_open_options.btrfs_compression {
+                    self.btrfs_needs_rotation(size)?
+                } else {
+                    size >= self.open_options.max_bytes_per_log
+                };
+
+                if needs_rotation {
                     // `self.writable_log()` will be rotated (i.e., becomes immutable).
                     // Make sure indexes are up-to-date so reading it would not require
                     // building missing indexes in-memory.
@@ -548,6 +619,54 @@ impl RotateLog {
         result
             .context("in RotateLog::sync")
             .context(|| format!("  RotateLog.dir = {:?}", self.dir))
+    }
+
+    fn btrfs_needs_rotation(&mut self, apparent_size: u64) -> crate::Result<bool> {
+        // Use predicted threshold based on btrfs compression ratio, if available.
+        let threshold = self
+            .next_btrfs_size_check
+            .unwrap_or(self.open_options.max_bytes_per_log);
+
+        if apparent_size < threshold {
+            // Avoid checking btrfs size if we haven't reached the threshold yet.
+            return Ok(false);
+        }
+
+        let btrfs_size = self.writable_log().btrfs_size()?;
+
+        debug!(btrfs_size, apparent_size, "btrfs physical size");
+
+        if btrfs_size >= self.open_options.max_bytes_per_log {
+            // Physical log size has passed the threshold - time to rotate.
+            return Ok(true);
+        }
+
+        if btrfs_size > 0 && apparent_size > 0 && !self.open_options.log_open_options.fsync {
+            // If we aren't fsyncing, compute compression ratio and predict when we
+            // are going to need rotation. This is to minimize btrfs size queries,
+            // which are relatively slow because they fsync the file.
+            let compression_ratio = (btrfs_size as f64) / (apparent_size as f64);
+            if compression_ratio > 0f64 {
+                let predicted_threshold =
+                    (self.open_options.max_bytes_per_log as f64 / compression_ratio) as u64;
+
+                // Cap our predicted threshold increase to self.open_options.max_bytes_per_log. For
+                // example, if max_bytes_per_log=10MB, and after 10MB of writes the log is only
+                // 100KB, we would "predict" a new threshold of 1GB based on the 1% compression
+                // ratio. Instead, cap the threshold at 20MB, lest the high compression was just
+                // temporary.
+                let predicted_threshold =
+                    predicted_threshold.min(apparent_size + self.open_options.max_bytes_per_log);
+
+                debug!(
+                    predicted_threshold,
+                    compression_ratio, "setting predicted rotation threshold"
+                );
+                self.next_btrfs_size_check = Some(predicted_threshold);
+            }
+        }
+
+        Ok(false)
     }
 
     fn update_change_detector_to_match_meta(&mut self) {
@@ -596,6 +715,9 @@ impl RotateLog {
     fn rotate_internal(&mut self, lock: &ScopedDirLock) -> crate::Result<()> {
         ROTATE_COUNT.fetch_add(1, Ordering::Relaxed);
 
+        // This is relative to the primary log, so clear it out when rotating.
+        self.next_btrfs_size_check.take();
+
         let span = debug_span!("RotateLog::rotate", latest = self.latest as u32);
         if let Some(dir) = &self.dir {
             span.record("dir", dir.to_string_lossy().as_ref());
@@ -611,8 +733,13 @@ impl RotateLog {
             lock,
         )?;
         if self.logs.len() >= self.open_options.max_log_count as usize {
-            self.logs.pop();
+            if let Some(log) = self.logs.pop().and_then(|mut l| l.take()) {
+                if self.is_consistent_reads() {
+                    self.pinned_logs.push(log);
+                }
+            }
         }
+
         self.logs.insert(0, create_log_cell(log));
         self.logs_len = AtomicUsize::new(self.logs.len());
         self.latest = next;
@@ -625,9 +752,29 @@ impl RotateLog {
         self.sync()
     }
 
-    fn set_logs(&mut self, logs: Vec<OnceCell<Log>>) {
+    fn set_logs(&mut self, latest: u8, logs: Vec<OnceCell<Log>>) {
+        // This is relative to the primary log, so clear it out when logs changed.
+        self.next_btrfs_size_check.take();
+
+        if self.is_consistent_reads() {
+            // If we are in "consistent read" mode, store any Logs we would be rotating out into
+            // self.pinned_logs. If "latest" has wrapped more than once, we may not pin the right
+            // Logs.
+            for mut to_pin in std::mem::take(&mut self.logs)
+                .into_iter()
+                .rev()
+                .take(latest.wrapping_sub(self.latest) as usize)
+            {
+                match to_pin.take() {
+                    Some(log) => self.pinned_logs.push(log),
+                    None => break,
+                }
+            }
+        }
+
         self.logs_len = AtomicUsize::new(logs.len());
         self.logs = logs;
+        self.latest = latest;
     }
 
     #[allow(clippy::nonminimal_bool)]
@@ -744,6 +891,43 @@ impl RotateLog {
     pub fn iter_dirty(&self) -> impl Iterator<Item = crate::Result<&[u8]>> {
         self.logs[0].get().unwrap().iter_dirty()
     }
+
+    /// Guarantee read-after-write consistency for this RotateLog while guard is alive. Log rotation
+    /// still happens as normal, but this RotateLog avoids dropping Log objects that have been
+    /// rotated.
+    ///
+    /// BUG: This currently does not work properly if there are more than 255 rotations by another
+    /// RotateLog instance before we reload from disk. The "latest" number is represented as a u8,
+    /// so we can't tell the difference between 1 and 256 rotations.
+    pub fn with_consistent_reads(&mut self) -> ConsistentReadGuard {
+        self.consistent_reads.fetch_add(1, Ordering::AcqRel);
+        ConsistentReadGuard {
+            count: self.consistent_reads.clone(),
+        }
+    }
+
+    /// Return whether we are in "consistent read" mode. This mode means we should not drop any
+    /// Logs, lest we lose track of writes we made while consistent read mode was active.
+    fn is_consistent_reads(&self) -> bool {
+        self.consistent_reads.load(Ordering::Acquire) > 0
+    }
+
+    /// If we aren't in "consistent read" mode, clear out any Logs we may have pinned.
+    fn maybe_clear_pinned_logs(&mut self) {
+        if !self.is_consistent_reads() {
+            self.pinned_logs.clear();
+        }
+    }
+}
+
+pub struct ConsistentReadGuard {
+    count: Arc<AtomicU64>,
+}
+
+impl Drop for ConsistentReadGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Wrap `Log` in a `OnceCell`.
@@ -769,12 +953,6 @@ fn load_log(dir: &Path, id: u8, open_options: log::OpenOptions) -> crate::Result
 pub trait RotateLowLevelExt {
     /// Get a view of all individual logs. Newest first.
     fn logs(&self) -> Vec<&Log>;
-
-    /// Forced rotate. This can be useful as a quick way to ensure new
-    /// data can be written when data corruption happens.
-    ///
-    /// Data not written will get lost.
-    fn force_rotate(&mut self) -> crate::Result<()>;
 }
 
 impl RotateLowLevelExt for RotateLog {
@@ -788,24 +966,6 @@ impl RotateLowLevelExt for RotateLog {
             .map(|res| res.unwrap().unwrap())
             .collect()
     }
-
-    fn force_rotate(&mut self) -> crate::Result<()> {
-        if self.dir.is_none() {
-            // rotate does not make sense for an in-memory RotateLog.
-            return Ok(());
-        }
-        // Read-write path. Take the directory lock.
-        let dir = self.dir.clone().unwrap();
-        let lock = ScopedDirLock::new(&dir)?;
-        self.latest = read_latest(self.dir.as_ref().unwrap())?;
-        self.rotate_internal(&lock)?;
-        self.set_logs(read_logs(
-            self.dir.as_ref().unwrap(),
-            &self.open_options,
-            self.latest,
-        )?);
-        Ok(())
-    }
 }
 
 /// Iterator over [`RotateLog`] entries selected by an index lookup.
@@ -813,6 +973,7 @@ pub struct RotateLogLookupIter<'a> {
     inner_iter: log::LogLookupIter<'a>,
     end: bool,
     log_rotate: &'a RotateLog,
+    pinned_logs: &'a [Log],
     log_index: usize,
     index_id: usize,
     key: Bytes,
@@ -820,13 +981,25 @@ pub struct RotateLogLookupIter<'a> {
 
 impl<'a> RotateLogLookupIter<'a> {
     fn load_next_log(&mut self) -> crate::Result<()> {
-        if self.log_index + 1 >= self.log_rotate.logs.len() {
+        // Iterate over self.log_rotate.logs (active logs) along with self.pinned_logs, which are
+        // previously rotated out Logs that we have temporarily held onto to provide
+        // read-after-write consistency.
+        if self.log_index + 1 >= self.log_rotate.logs.len() + self.pinned_logs.len() {
             self.end = true;
             Ok(())
         } else {
             // Try the next log
             self.log_index += 1;
-            match self.log_rotate.load_log(self.log_index) {
+
+            let log = if self.log_index >= self.log_rotate.logs.len() {
+                Ok(self
+                    .pinned_logs
+                    .get(self.log_index - self.log_rotate.logs.len()))
+            } else {
+                self.log_rotate.load_log(self.log_index)
+            };
+
+            match log {
                 Ok(None) => {
                     self.end = true;
                     Ok(())
@@ -1213,26 +1386,6 @@ mod tests {
     #[test]
     fn test_wrapping_rotate_255() {
         test_wrapping_rotate(255)
-    }
-
-    #[test]
-    fn test_force_rotate() {
-        let dir = tempdir().unwrap();
-        let mut rotate = OpenOptions::new()
-            .create(true)
-            .max_bytes_per_log(1 << 30)
-            .max_log_count(3)
-            .open(&dir)
-            .unwrap();
-
-        use super::RotateLowLevelExt;
-        assert_eq!(rotate.logs().len(), 1);
-        rotate.force_rotate().unwrap();
-        assert_eq!(rotate.logs().len(), 2);
-        rotate.force_rotate().unwrap();
-        assert_eq!(rotate.logs().len(), 3);
-        rotate.force_rotate().unwrap();
-        assert_eq!(rotate.logs().len(), 3);
     }
 
     #[test]
@@ -1937,5 +2090,169 @@ Reset latest to 2"#
         let log = open_opts.open(dir.path()).unwrap();
         let count = log.iter().count() as u64;
         assert_eq!(count, THREAD_COUNT as u64 * WRITE_COUNT_PER_THREAD as u64);
+    }
+
+    #[test]
+    fn test_btrfs_rotate() {
+        let dir = tempdir().unwrap();
+
+        if fsinfo::fstype(dir.path()).unwrap() != fsinfo::FsType::BTRFS {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use rand::RngCore;
+
+            let mut rotate = OpenOptions::new()
+                .create(true)
+                .max_bytes_per_log(50)
+                .max_log_count(2)
+                .index("first-byte", |_| vec![IndexOutput::Reference(0..1)])
+                .btrfs_compression(true)
+                .open(&dir)
+                .unwrap();
+
+            // No rotation - log is compressed well.
+            let aaa = vec![b'a'; 100];
+            rotate.append(&aaa).unwrap();
+            assert_eq!(rotate.sync().unwrap(), 0);
+            assert_eq!(lookup(&rotate, b"a"), vec![&aaa]);
+
+            // Sanity check we compressed well.
+            let btrfs_size = rotate.writable_log().btrfs_size().unwrap();
+            assert!(btrfs_size > 0);
+            assert!(btrfs_size < 50);
+
+            // Rotate triggered.
+            let mut random_bytes = vec![0u8; 100];
+            rand::thread_rng().fill_bytes(&mut random_bytes);
+            random_bytes[0] = b'b';
+            rotate.append(&random_bytes).unwrap();
+            assert_eq!(rotate.sync().unwrap(), 1);
+            assert_eq!(lookup(&rotate, b"a"), vec![&aaa]);
+            assert_eq!(lookup(&rotate, b"b"), vec![&random_bytes]);
+
+            let rotated_btrfs_size = rotate.logs[1].get_mut().unwrap().btrfs_size().unwrap();
+            assert!(rotated_btrfs_size >= 50);
+        }
+    }
+
+    #[test]
+    fn test_consistent_reads() {
+        // Set threshold low so we get a lot of rotation
+        let open_opts = OpenOptions::new()
+            .create(true)
+            .max_log_count(2)
+            .max_bytes_per_log(1)
+            .auto_sync_threshold(0)
+            .index_defs(vec![IndexDef::new("key", |data| {
+                vec![IndexOutput::Reference(0..data.len() as u64)]
+            })]);
+
+        let get = |log: &RotateLog, key: &[u8]| -> Option<Vec<u8>> {
+            Some(
+                log.lookup(0, key.to_vec())
+                    .unwrap()
+                    .next()?
+                    .unwrap()
+                    .to_vec(),
+            )
+        };
+
+        // Sanity check how rotation is working.
+        {
+            let dir = tempdir().unwrap();
+
+            let mut log = open_opts.open(dir.path()).unwrap();
+
+            // Log 0 is rotated immediately to log 1.
+            log.append(b"a").unwrap();
+            assert_eq!(get(&log, b"a"), Some(vec![b'a']));
+
+            // Log 1 is dropped - log 0 rotated to log 1.
+            log.append(b"b").unwrap();
+            assert_eq!(get(&log, b"b"), Some(vec![b'b']));
+            assert_eq!(get(&log, b"a"), None);
+        }
+
+        // Now again with consistent reads enabled.
+        {
+            let dir = tempdir().unwrap();
+
+            let mut log = open_opts.open(dir.path()).unwrap();
+
+            let _guard = log.with_consistent_reads();
+
+            log.append(b"a").unwrap();
+            assert_eq!(get(&log, b"a"), Some(vec![b'a']));
+
+            // All entries still readable.
+            log.append(b"b").unwrap();
+            log.append(b"c").unwrap();
+            assert_eq!(get(&log, b"c"), Some(vec![b'c']));
+            assert_eq!(get(&log, b"b"), Some(vec![b'b']));
+            assert_eq!(get(&log, b"a"), Some(vec![b'a']));
+
+            // Drop consistent guard - rotated data is gone.
+            drop(_guard);
+            assert_eq!(get(&log, b"a"), None);
+        }
+
+        // Now with consistent reads and another writer to the log.
+        {
+            let dir = tempdir().unwrap();
+
+            let mut log1 = open_opts.open(dir.path()).unwrap();
+            let mut log2 = open_opts.open(dir.path()).unwrap();
+
+            let _guard = log1.with_consistent_reads();
+
+            log1.append(b"a").unwrap();
+
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+
+            log1.append(b"b").unwrap();
+
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+
+            log1.append(b"c").unwrap();
+
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+            log2.append(b"z").unwrap();
+
+            assert_eq!(get(&log1, b"c"), Some(vec![b'c']));
+            assert_eq!(get(&log1, b"b"), Some(vec![b'b']));
+            assert_eq!(get(&log1, b"a"), Some(vec![b'a']));
+            // Can't see "z" - it was rotated out when we appended "c".
+            assert_eq!(get(&log1, b"z"), None);
+
+            // Not buffering anything.
+            assert!(log1.writable_log().mem_buf.is_empty());
+
+            log1.sync().unwrap();
+            assert_eq!(get(&log1, b"c"), Some(vec![b'c']));
+            assert_eq!(get(&log1, b"b"), Some(vec![b'b']));
+            assert_eq!(get(&log1, b"a"), Some(vec![b'a']));
+            // Now we can see "z" since we reloaded logs from disk.
+            assert_eq!(get(&log1, b"z"), Some(vec![b'z']));
+
+            // Drop consistent guard - rotated data is gone.
+            drop(_guard);
+            assert_eq!(get(&log1, b"a"), None);
+            assert_eq!(get(&log1, b"z"), Some(vec![b'z']));
+
+            // Pinned logs haven't been cleaned up yet.
+            assert!(!log1.pinned_logs.is_empty());
+
+            // But they get cleaned at the next chance.
+            log1.sync().unwrap();
+            assert!(log1.pinned_logs.is_empty());
+        }
     }
 }

@@ -471,7 +471,7 @@ void SaplingBackingStore::processBlobImportRequests(
         request->getCause(),
         request->getPid()));
 
-    XLOGF(DBG4, "Processing blob request for {}", blobImport->hash);
+    XLOGF(DBG4, "Processing blob request for {}", blobImport->id);
   }
 
   getBlobBatch(requests, sapling::FetchMode::AllowRemote);
@@ -486,9 +486,13 @@ void SaplingBackingStore::getBlobBatch(
   auto requests = std::move(preparedRequests.second);
   folly::stop_watch<std::chrono::milliseconds> batchWatch;
 
+  auto allowIgnoreResult =
+      config_->getEdenConfig()->ignorePrefetchResult.getValue();
+
   store_.getBlobBatch(
       folly::range(requests),
       fetchMode,
+      allowIgnoreResult,
       // store_->getBlobBatch is blocking, hence we can take these by reference.
       [&](size_t index, folly::Try<std::unique_ptr<folly::IOBuf>> content) {
         if (content.hasException()) {
@@ -522,8 +526,14 @@ void SaplingBackingStore::getBlobBatch(
         auto& [importRequestList, watch] = importRequestsMap[nodeId];
         auto result = content.hasException()
             ? folly::Try<BlobPtr>{content.exception()}
-            : folly::Try{
-                  std::make_shared<BlobPtr::element_type>(*content.value())};
+            : content.value()
+            ? folly::Try{std::make_shared<BlobPtr::element_type>(
+                  *content.value())}
+            // Propagate null content as nullptr. This happens when we use the
+            // IGNORE_RESULT flag during blob prefetching. I think nullptr is
+            // "safer" than setting an empty blob since we want to be confident
+            // that no code uses the blob thinking there is content.
+            : folly::Try<BlobPtr>{nullptr};
         for (auto& importRequest : importRequestList) {
           importRequest->getPromise<BlobPtr>()->setWith(
               [&]() -> folly::Try<BlobPtr> { return result; });
@@ -578,7 +588,7 @@ void SaplingBackingStore::processTreeImportRequests(
         request->getCause(),
         request->getPid()));
 
-    XLOGF(DBG4, "Processing tree request for {}", treeImport->hash);
+    XLOGF(DBG4, "Processing tree request for {}", treeImport->id);
   }
 
   getTreeBatch(requests, sapling::FetchMode::AllowRemote);
@@ -649,7 +659,7 @@ void SaplingBackingStore::getTreeBatch(
                 }
                 return folly::Try{fromRawTree(
                     content.value().get(),
-                    treeRequest->hash,
+                    treeRequest->id,
                     treeRequest->proxyHash.path(),
                     hgObjectIdFormat)};
               });
@@ -696,17 +706,17 @@ SaplingBackingStore::prepareRequests(
           XLOGF_IF(
               DBG9,
               UNLIKELY(
-                  priorRequest->template getRequest<T>()->hash !=
-                  importRequest->getRequest<T>()->hash),
-              "{} requests have the same proxyHash (HgProxyHash) but different hash (ObjectId). "
-              "This should not happen. Previous request: hash='{}', proxyHash='{}', proxyHash.path='{}'; "
-              "current request: hash='{}', proxyHash ='{}', proxyHash.path='{}'.",
+                  priorRequest->template getRequest<T>()->id !=
+                  importRequest->getRequest<T>()->id),
+              "{} requests have the same proxyHash (HgProxyHash) but different id (ObjectId). "
+              "This should not happen. Previous request: id='{}', proxyHash='{}', proxyHash.path='{}'; "
+              "current request: id='{}', proxyHash ='{}', proxyHash.path='{}'.",
               stringOfSaplingImportObject(requestType),
-              priorRequest->template getRequest<T>()->hash.asHexString(),
+              priorRequest->template getRequest<T>()->id.asHexString(),
               folly::hexlify(
                   priorRequest->template getRequest<T>()->proxyHash.byteHash()),
               priorRequest->template getRequest<T>()->proxyHash.path(),
-              importRequest->getRequest<T>()->hash.asHexString(),
+              importRequest->getRequest<T>()->id.asHexString(),
               folly::hexlify(
                   importRequest->getRequest<T>()->proxyHash.byteHash()),
               importRequest->getRequest<T>()->proxyHash.path());
@@ -802,7 +812,7 @@ void SaplingBackingStore::processBlobAuxImportRequests(
         request->getCause(),
         request->getPid()));
 
-    XLOGF(DBG4, "Processing blob aux request for {}", blobAuxImport->hash);
+    XLOGF(DBG4, "Processing blob aux request for {}", blobAuxImport->id);
   }
 
   getBlobAuxDataBatch(requests, sapling::FetchMode::AllowRemote);
@@ -845,7 +855,7 @@ void SaplingBackingStore::processTreeAuxImportRequests(
         request->getCause(),
         request->getPid()));
 
-    XLOGF(DBG4, "Processing tree aux request for {}", treeAuxImport->hash);
+    XLOGF(DBG4, "Processing tree aux request for {}", treeAuxImport->id);
   }
 
   getTreeAuxDataBatch(requests, sapling::FetchMode::AllowRemote);
@@ -1054,8 +1064,8 @@ ObjectComparison SaplingBackingStore::compareObjectsById(
   // If rev hashes differ, and hg IDs aren't bijective, then we don't know
   // whether the IDs refer to the same contents or not.
   //
-  // Mercurial's blob hashes also include history aux data, so there may be
-  // multiple different blob hashes for the same file contents.
+  // Mercurial's blob ids also include history aux data, so there may be
+  // multiple different blob ids for the same file contents.
   return ObjectComparison::Unknown;
 }
 
@@ -1401,7 +1411,7 @@ SaplingBackingStore::getBlobEnqueue(
   auto getBlobFuture = makeImmediateFutureWith([&] {
     XLOGF(
         DBG4,
-        "making blob import request for {}, hash is: {}",
+        "making blob import request for {}, id is: {}",
         proxyHash.path(),
         id);
     auto requestContext = context.copy();
@@ -1501,7 +1511,7 @@ SaplingBackingStore::getBlobAuxDataEnqueue(
   auto getBlobAuxFuture = makeImmediateFutureWith([&] {
     XLOGF(
         DBG4,
-        "making blob meta import request for {}, hash is: {}",
+        "making blob meta import request for {}, id is: {}",
         proxyHash.path(),
         id);
     auto requestContext = context.copy();
@@ -1589,16 +1599,16 @@ SaplingBackingStore::getRootTree(
                         DBG1,
                         "imported mercurial commit {} as tree {}",
                         commitId,
-                        rootTree->getHash());
+                        rootTree->getObjectId());
                     stats_->addDuration(
                         &SaplingBackingStoreStats::getRootTree,
                         watch.elapsed());
                     localStore_->put(
                         KeySpace::HgCommitToTreeFamily,
                         commitId,
-                        rootTree->getHash().getBytes());
+                        rootTree->getObjectId().getBytes());
                     return BackingStore::GetRootTreeResult{
-                        rootTree, rootTree->getHash()};
+                        rootTree, rootTree->getObjectId()};
                   });
             }
 
@@ -1614,7 +1624,8 @@ SaplingBackingStore::getRootTree(
                 .thenValue([this, watch](TreePtr tree) {
                   stats_->addDuration(
                       &SaplingBackingStoreStats::getRootTree, watch.elapsed());
-                  return BackingStore::GetRootTreeResult{tree, tree->getHash()};
+                  return BackingStore::GetRootTreeResult{
+                      tree, tree->getObjectId()};
                 });
           });
 }
@@ -2041,14 +2052,14 @@ ImmediateFuture<folly::Unit> SaplingBackingStore::importManifestForRoot(
                       "imported mercurial commit {} with manifest {} as tree {}",
                       commitId,
                       manifestId,
-                      rootTree->getHash());
+                      rootTree->getObjectId());
                   stats_->addDuration(
                       &SaplingBackingStoreStats::importManifestForRoot,
                       watch.elapsed());
                   localStore_->put(
                       KeySpace::HgCommitToTreeFamily,
                       commitId,
-                      rootTree->getHash().getBytes());
+                      rootTree->getObjectId().getBytes());
                 });
           });
 }

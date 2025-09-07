@@ -15,7 +15,6 @@ use minibytes::Bytes;
 use storemodel::SerializationFormat;
 use types::HgId;
 
-use crate::Metadata;
 use crate::indexedlogdatastore::Entry;
 use crate::lfs::LfsPointersEntry;
 use crate::lfs::content_header_from_pointer;
@@ -29,7 +28,7 @@ pub(crate) enum LazyFile {
     IndexedLog(Entry, SerializationFormat),
 
     /// A local LfsStore entry.
-    Lfs(Bytes, LfsPointersEntry, SerializationFormat),
+    Lfs(Blob, LfsPointersEntry, SerializationFormat),
 
     /// An SaplingRemoteApi FileEntry.
     SaplingRemoteApi(FileEntry, SerializationFormat),
@@ -112,7 +111,7 @@ impl LazyFile {
                     SerializationFormat::Hg => Some(content_header_from_pointer(ptr)),
                     SerializationFormat::Git => None,
                 };
-                (Blob::Bytes(blob.clone()), content_header)
+                (blob.clone(), content_header)
             }
             SaplingRemoteApi(entry, format) => {
                 let (content, header) = split_file_metadata(&entry.data()?, *format);
@@ -127,25 +126,10 @@ impl LazyFile {
         use LazyFile::*;
         Ok(match self {
             IndexedLog(entry, _) => entry.content()?,
-            Lfs(blob, ptr, _) => rebuild_metadata(blob.clone(), ptr),
+            // TODO(muirdm): avoid blob copy
+            Lfs(blob, ptr, _) => rebuild_metadata(blob.to_bytes(), ptr),
             SaplingRemoteApi(entry, _) => entry.data()?,
             Cas(_) => bail!("CAS data has no copy info"),
-        })
-    }
-
-    pub(crate) fn metadata(&self) -> Result<Metadata> {
-        use LazyFile::*;
-        Ok(match self {
-            IndexedLog(entry, _) => entry.metadata().clone(),
-            Lfs(_, ptr, _) => Metadata {
-                size: Some(ptr.size()),
-                flags: None,
-            },
-            SaplingRemoteApi(entry, _) => entry.metadata()?.clone(),
-            Cas(data) => Metadata {
-                size: Some(data.len() as u64),
-                flags: None,
-            },
         })
     }
 }

@@ -1,4 +1,4 @@
-load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
+load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 
 oncall("sapling")
 
@@ -7,6 +7,7 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     crate_root = "src/lib.rs",
     deps = [
-        "//eden/scm/lib/minibytes:minibytes",
+        "//eden/scm/lib/blob:blob",
+        "//eden/scm/lib/types:types",
     ],
 )

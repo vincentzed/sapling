@@ -503,7 +503,7 @@ pub async fn extend_from_dag_with_actions<'a, R: Repo>(
                 .ok_or_else(|| anyhow!("No commit {} for bookmark {}", name, bookmark))?;
             let old_value = repo
                 .bookmarks()
-                .get(ctx.clone(), &bookmark)
+                .get(ctx.clone(), &bookmark, bookmarks::Freshness::MostRecent)
                 .await
                 .with_context(|| format!("Failed to resolve bookmark '{}'", bookmark))?;
             // It's better to update/create rather than force_set which doesn't
@@ -696,7 +696,7 @@ pub async fn create_from_dag<R: Repo>(
 /// ```
 #[macro_export]
 macro_rules! __drawdag_changes {
-    ( $( $key:expr_2021 => | $c:ident | $body:expr_2021 ),* $( , )? ) => {
+    ( $( $key:expr => | $c:ident | $body:expr ),* $( , )? ) => {
         {
             let mut changes: std::collections::BTreeMap<String, Box<$crate::drawdag::ChangeFn<_>>> =
                 std::collections::BTreeMap::new();
@@ -706,7 +706,7 @@ macro_rules! __drawdag_changes {
             changes
         }
     };
-    ( $( $key:expr_2021 => | $c:ident, $d: ident | $body:expr_2021 ),* $( , )? ) => {
+    ( $( $key:expr => | $c:ident, $d: ident | $body:expr ),* $( , )? ) => {
         {
             let mut changes: std::collections::BTreeMap<String, Box<$crate::drawdag::ChangeFn<_>>> =
                 std::collections::BTreeMap::new();

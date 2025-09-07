@@ -31,20 +31,41 @@ using namespace std::chrono_literals;
 
 constexpr auto materializationTimeoutLimit = 1000ms;
 
-std::ostream& operator<<(std::ostream& os, const timespec& ts) {
-  return os << fmt::format("{}.{:09d}", ts.tv_sec, ts.tv_nsec);
-}
+template <>
+struct fmt::formatter<timespec> {
+  constexpr auto parse(format_parse_context& ctx) {
+    return ctx.begin();
+  }
 
-namespace std::chrono {
-std::ostream& operator<<(
-    std::ostream& os,
-    const std::chrono::system_clock::time_point& tp) {
-  auto duration = tp.time_since_epoch();
-  auto secs = duration_cast<std::chrono::seconds>(duration);
-  auto nsecs = duration_cast<std::chrono::nanoseconds>(duration - secs);
-  return os << fmt::format("{}.{:09d}", secs.count(), nsecs.count());
+  template <typename FormatContext>
+  auto format(const timespec& ts, FormatContext& ctx) {
+    return fmt::format_to(ctx.out(), "{}.{:09d}", ts.tv_sec, ts.tv_nsec);
+  }
+};
+
+template <>
+struct fmt::formatter<std::chrono::system_clock::time_point> {
+  constexpr auto parse(format_parse_context& ctx) {
+    return ctx.begin();
+  }
+
+  template <typename FormatContext>
+  auto format(
+      const std::chrono::system_clock::time_point& tp,
+      FormatContext& ctx) {
+    auto duration = tp.time_since_epoch();
+    auto secs = std::chrono::duration_cast<std::chrono::seconds>(duration);
+    auto nsecs =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(duration - secs);
+    return fmt::format_to(ctx.out(), "{}.{:09d}", secs.count(), nsecs.count());
+  }
+};
+
+// Helper function to avoid GoogleTest formatting issues with chrono types
+template <typename T>
+std::string formatTimePoint(const T& tp) {
+  return fmt::format("{}", tp);
 }
-} // namespace std::chrono
 
 /*
  * Helper functions for comparing timespec structs from file attributes
@@ -212,9 +233,9 @@ TEST_F(FileInodeTest, getattrFromOverlay) {
   EXPECT_EQ((S_IFREG | 0644), attr.st_mode);
   EXPECT_EQ(12, attr.st_size);
   EXPECT_EQ(1, attr.st_blocks);
-  EXPECT_EQ(stAtimepoint(attr), start);
-  EXPECT_EQ(stMtimepoint(attr), start);
-  EXPECT_EQ(stCtimepoint(attr), start);
+  EXPECT_EQ(formatTimePoint(stAtimepoint(attr)), formatTimePoint(start));
+  EXPECT_EQ(formatTimePoint(stMtimepoint(attr)), formatTimePoint(start));
+  EXPECT_EQ(formatTimePoint(stCtimepoint(attr)), formatTimePoint(start));
 }
 
 void testSetattrTruncateAll(TestMount& mount) {
@@ -239,7 +260,11 @@ TEST_F(FileInodeTest, setattrTruncateAllMaterialized) {
   // Modify the inode before running the test, so that
   // it will be materialized in the overlay.
   auto inode = mount_.getFileInode("dir/a.txt");
-  inode->write("THIS IS A.TXT.\n", 0, ObjectFetchContext::getNullContext());
+  auto written =
+      inode->write("THIS IS A.TXT.\n", 0, ObjectFetchContext::getNullContext())
+          .get();
+  EXPECT_EQ(15, written);
+  EXPECT_TRUE(inode->isMaterialized());
   inode.reset();
 
   testSetattrTruncateAll(mount_);
@@ -331,8 +356,8 @@ TEST_F(FileInodeTest, setattrAtime) {
 
   BASIC_ATTR_XCHECKS(inode, attr);
   EXPECT_EQ(
-      mount_.getClock().getTimePoint(),
-      folly::to<FakeClock::time_point>(stAtime(attr)));
+      formatTimePoint(mount_.getClock().getTimePoint()),
+      formatTimePoint(folly::to<FakeClock::time_point>(stAtime(attr))));
 }
 
 void testSetattrMtime(TestMount& mount) {
@@ -360,7 +385,9 @@ void testSetattrMtime(TestMount& mount) {
   attr = setFileAttr(mount, inode, desired);
 
   BASIC_ATTR_XCHECKS(inode, attr);
-  EXPECT_EQ(start, folly::to<FakeClock::time_point>(stMtime(attr)));
+  EXPECT_EQ(
+      formatTimePoint(start),
+      formatTimePoint(folly::to<FakeClock::time_point>(stMtime(attr))));
 }
 
 TEST_F(FileInodeTest, setattrMtime) {
@@ -371,32 +398,30 @@ TEST_F(FileInodeTest, setattrMtimeMaterialized) {
   // Modify the inode before running the test, so that
   // it will be materialized in the overlay.
   auto inode = mount_.getFileInode("dir/a.txt");
-  inode->write("THIS IS A.TXT.\n", 0, ObjectFetchContext::getNullContext());
+  auto written =
+      inode->write("THIS IS A.TXT.\n", 0, ObjectFetchContext::getNullContext())
+          .get();
+  EXPECT_EQ(15, written);
+  EXPECT_TRUE(inode->isMaterialized());
   inode.reset();
 
   testSetattrMtime(mount_);
 }
-
-namespace {
-bool isInodeMaterialized(const TreeInodePtr& inode) {
-  return inode->getContents().wlock()->isMaterialized();
-}
-} // namespace
 
 TEST_F(FileInodeTest, writingMaterializesParent) {
   auto inode = mount_.getFileInode("dir/sub/b.txt");
   auto parent = mount_.getTreeInode("dir/sub");
   auto grandparent = mount_.getTreeInode("dir");
 
-  EXPECT_EQ(false, isInodeMaterialized(grandparent));
-  EXPECT_EQ(false, isInodeMaterialized(parent));
+  EXPECT_EQ(false, grandparent->isMaterialized());
+  EXPECT_EQ(false, parent->isMaterialized());
 
   auto written =
       inode->write("abcd", 0, ObjectFetchContext::getNullContext()).get();
   EXPECT_EQ(4, written);
 
-  EXPECT_EQ(true, isInodeMaterialized(grandparent));
-  EXPECT_EQ(true, isInodeMaterialized(parent));
+  EXPECT_EQ(true, grandparent->isMaterialized());
+  EXPECT_EQ(true, parent->isMaterialized());
 }
 
 TEST_F(FileInodeTest, truncatingMaterializesParent) {
@@ -404,15 +429,15 @@ TEST_F(FileInodeTest, truncatingMaterializesParent) {
   auto parent = mount_.getTreeInode("dir/sub");
   auto grandparent = mount_.getTreeInode("dir");
 
-  EXPECT_EQ(false, isInodeMaterialized(grandparent));
-  EXPECT_EQ(false, isInodeMaterialized(parent));
+  EXPECT_EQ(false, grandparent->isMaterialized());
+  EXPECT_EQ(false, parent->isMaterialized());
 
   DesiredMetadata desired;
   desired.size = 0;
   (void)inode->setattr(desired, ObjectFetchContext::getNullContext()).get(0ms);
 
-  EXPECT_EQ(true, isInodeMaterialized(grandparent));
-  EXPECT_EQ(true, isInodeMaterialized(parent));
+  EXPECT_EQ(true, grandparent->isMaterialized());
+  EXPECT_EQ(true, parent->isMaterialized());
 }
 
 TEST_F(FileInodeTest, addNewMaterializationsToInodeTraceBus) {
@@ -618,18 +643,18 @@ TEST(FileInode, dropsCacheWhenFullyRead) {
   auto blobCache = mount.getBlobCache();
 
   auto inode = mount.getFileInode("bigfile.txt");
-  auto hash = inode->getObjectId().value();
+  auto id = inode->getObjectId().value();
 
-  EXPECT_FALSE(blobCache->get(hash).object);
+  EXPECT_FALSE(blobCache->get(id).object);
 
   inode->read(4, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   inode->read(4, 4, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   inode->read(4, 8, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 }
 
 TEST(FileInode, keepsCacheIfPartiallyReread) {
@@ -639,22 +664,22 @@ TEST(FileInode, keepsCacheIfPartiallyReread) {
   auto blobCache = mount.getBlobCache();
 
   auto inode = mount.getFileInode("bigfile.txt");
-  auto hash = inode->getObjectId().value();
+  auto id = inode->getObjectId().value();
 
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 
   inode->read(6, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   inode->read(6, 6, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 
   inode->read(6, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   // Evicts again on the second full read!
   inode->read(6, 6, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 }
 
 TEST(FileInode, dropsCacheWhenMaterialized) {
@@ -664,15 +689,16 @@ TEST(FileInode, dropsCacheWhenMaterialized) {
   auto blobCache = mount.getBlobCache();
 
   auto inode = mount.getFileInode("bigfile.txt");
-  auto hash = inode->getObjectId().value();
+  auto id = inode->getObjectId().value();
 
-  EXPECT_FALSE(blobCache->get(hash).object);
+  EXPECT_FALSE(blobCache->get(id).object);
 
   inode->read(4, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   inode->write("data"_sp, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_TRUE(inode->isMaterialized());
+  EXPECT_FALSE(blobCache->contains(id));
 }
 
 TEST(FileInode, dropsCacheWhenUnloaded) {
@@ -682,14 +708,14 @@ TEST(FileInode, dropsCacheWhenUnloaded) {
   auto blobCache = mount.getBlobCache();
 
   auto inode = mount.getFileInode("bigfile.txt");
-  auto hash = inode->getObjectId().value();
+  auto id = inode->getObjectId().value();
 
   inode->read(4, 0, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash));
+  EXPECT_TRUE(blobCache->contains(id));
 
   inode.reset();
   mount.getEdenMount()->getRootInode()->unloadChildrenNow();
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 }
 
 TEST(FileInode, reloadsBlobIfCacheIsEvicted) {
@@ -699,15 +725,15 @@ TEST(FileInode, reloadsBlobIfCacheIsEvicted) {
   auto blobCache = mount.getBlobCache();
 
   auto inode = mount.getFileInode("bigfile.txt");
-  auto hash = inode->getObjectId().value();
+  auto id = inode->getObjectId().value();
 
   inode->read(4, 0, ObjectFetchContext::getNullContext()).get(0ms);
   blobCache->clear();
-  EXPECT_FALSE(blobCache->contains(hash));
+  EXPECT_FALSE(blobCache->contains(id));
 
   inode->read(4, 4, ObjectFetchContext::getNullContext()).get(0ms);
-  EXPECT_TRUE(blobCache->contains(hash))
-      << fmt::format("reading should insert hash {} into cache", hash);
+  EXPECT_TRUE(blobCache->contains(id))
+      << fmt::format("reading should insert id {} into cache", id);
 }
 
 // TODO: test multiple flags together

@@ -752,33 +752,6 @@ FuseChannel::InvalidationEntry::
   }
 }
 
-void toAppend(
-    const FuseChannel::InvalidationEntry& entry,
-    std::string* result) {
-  switch (entry.type) {
-    case FuseChannel::InvalidationType::INODE:
-      *result += fmt::format(
-          "(inode {}, offset {}, length {})",
-          entry.inode,
-          entry.range.offset,
-          entry.range.length);
-      return;
-    case FuseChannel::InvalidationType::DIR_ENTRY:
-      *result +=
-          fmt::format("(inode {}, child \"{}\")", entry.inode, entry.name);
-      return;
-    case FuseChannel::InvalidationType::FLUSH:
-      *result += "(invalidation flush)";
-      return;
-    default:
-      *result += fmt::format(
-          "(unknown invalidation type {} inode {})",
-          static_cast<uint64_t>(entry.type),
-          entry.inode);
-      return;
-  }
-}
-
 void FuseChannel::replyError(const fuse_in_header& request, int errorCode) {
   fuse_out_header err;
   err.len = sizeof(err);
@@ -1216,7 +1189,8 @@ void FuseChannel::sendInvalidateInode(
           len,
           exc.what());
       throwSystemErrorExplicit(
-          exc.code().value(), "error invalidating FUSE inode ", ino);
+          exc.code().value(),
+          fmt::format("error invalidating FUSE inode {}", ino));
     } else {
       XLOGF(
           DBG6,
@@ -1275,10 +1249,10 @@ void FuseChannel::sendInvalidateEntry(
     if (!isEnoent(exc)) {
       throwSystemErrorExplicit(
           exc.code().value(),
-          "error invalidating FUSE entry ",
-          namePiece,
-          " in directory inode ",
-          parent);
+          fmt::format(
+              "error invalidating FUSE entry {} in directory inode {}",
+              namePiece,
+              parent));
     } else {
       XLOGF(
           DBG3,
@@ -1846,7 +1820,7 @@ void FuseChannel::processSession() {
       case FUSE_SETLKW:
         // Deliberately not handling locking; this causes
         // the kernel to do it for us
-        XLOGF(DBG7, "{}", fuseOpcodeName(header->opcode));
+        XLOG(DBG7, fuseOpcodeName(header->opcode));
         replyError(*header, ENOSYS);
         break;
 

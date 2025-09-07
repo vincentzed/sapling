@@ -176,7 +176,15 @@ async fn get_repo_objects_count(
             Ok(over)
         }
         None => {
-            let maybe_bookmark = bookmarks.get(ctx.clone(), bookmark_name).await?;
+            let maybe_bookmark = bookmarks
+                .get(
+                    ctx.clone(),
+                    bookmark_name,
+                    // Staleness is rarely close to 1s, so repo_stats_logger should
+                    // be able to read bookmark values from replicas
+                    bookmarks::Freshness::MaybeStale,
+                )
+                .await?;
             if let Some(cs_id) = maybe_bookmark {
                 let count = get_descendant_count(
                     ctx,

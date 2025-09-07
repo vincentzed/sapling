@@ -71,11 +71,29 @@ mononoke_queries! {
          WHERE source_of_truth = {source_of_truth}"
     }
 
-    write Set(repo_id: RepositoryId, repo_name: RepositoryName, source_of_truth: GitSourceOfTruth) {
+    write InsertOrUpdateRepo(repo_id: RepositoryId, repo_name: RepositoryName, source_of_truth: GitSourceOfTruth) {
         none,
         mysql("INSERT INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES ({repo_id}, {repo_name}, {source_of_truth}) ON DUPLICATE KEY UPDATE source_of_truth = {source_of_truth}")
         sqlite("REPLACE INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES ({repo_id}, {repo_name}, {source_of_truth})")
     }
+
+    write InsertRepos(
+        values: (repo_id: RepositoryId, repo_name: RepositoryName, source_of_truth: GitSourceOfTruth)
+    ) {
+        none,
+        "INSERT INTO git_repositories_source_of_truth (repo_id, repo_name, source_of_truth) VALUES {values}"
+    }
+
+    write UpdateSourceOfTruthByRepoNames(
+        source_of_truth: GitSourceOfTruth,
+        >list repo_names: RepositoryName
+    ) {
+        none,
+        "UPDATE git_repositories_source_of_truth
+         SET source_of_truth = {source_of_truth}
+         WHERE repo_name IN {repo_names}"
+    }
+
 }
 
 fn row_to_entry(
@@ -131,19 +149,50 @@ impl SqlConstructFromMetadataDatabaseConfig for SqlGitSourceOfTruthConfigBuilder
 
 #[async_trait]
 impl GitSourceOfTruthConfig for SqlGitSourceOfTruthConfig {
-    async fn set(
+    async fn insert_or_update_repo(
         &self,
         ctx: &CoreContext,
         repo_id: RepositoryId,
         repo_name: RepositoryName,
         source_of_truth: GitSourceOfTruth,
     ) -> Result<()> {
-        Set::query(
+        InsertOrUpdateRepo::query(
             &self.connections.write_connection,
             ctx.sql_query_telemetry(),
             &repo_id,
             &repo_name,
             &source_of_truth,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_repos(
+        &self,
+        ctx: &CoreContext,
+        repos: &[(RepositoryId, RepositoryName, GitSourceOfTruth)],
+    ) -> Result<()> {
+        let repos_refs = repos.iter().map(|(a, b, c)| (a, b, c)).collect::<Vec<_>>();
+        InsertRepos::query(
+            &self.connections.write_connection,
+            ctx.sql_query_telemetry(),
+            &repos_refs,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn update_source_of_truth_by_repo_names(
+        &self,
+        ctx: &CoreContext,
+        source_of_truth: GitSourceOfTruth,
+        repo_names: &[RepositoryName],
+    ) -> Result<()> {
+        UpdateSourceOfTruthByRepoNames::query(
+            &self.connections.write_connection,
+            ctx.sql_query_telemetry(),
+            &source_of_truth,
+            repo_names,
         )
         .await?;
         Ok(())
@@ -200,6 +249,16 @@ impl GitSourceOfTruthConfig for SqlGitSourceOfTruthConfig {
         Ok(rows.into_iter().map(row_to_entry).collect())
     }
 
+    async fn get_reserved(&self, ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
+        let rows = GetByGitSourceOfTruth::query(
+            &self.connections.read_master_connection,
+            ctx.sql_query_telemetry(),
+            &GitSourceOfTruth::Reserved,
+        )
+        .await?;
+        Ok(rows.into_iter().map(row_to_entry).collect())
+    }
+
     async fn get_max_id(&self, ctx: &CoreContext) -> Result<Option<RepositoryId>> {
         let from_db = GetMaxId::query(
             &self.connections.read_master_connection,
@@ -226,7 +285,7 @@ mod test {
     use super::*;
 
     #[mononoke::fbinit_test]
-    async fn test_set(fb: FacebookInit) -> Result<()> {
+    async fn test_insert_or_update_repo(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let builder = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?;
         let push = builder.clone().build();
@@ -234,7 +293,7 @@ mod test {
         // insert one
         let repo_id = RepositoryId::new(1);
         let repo_name = RepositoryName("test1".to_string());
-        push.set(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
+        push.insert_or_update_repo(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
             .await?;
         let entry = push
             .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
@@ -248,7 +307,7 @@ mod test {
         // insert another
         let repo_id = RepositoryId::new(2);
         let repo_name = RepositoryName("test2".to_string());
-        push.set(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Metagit)
+        push.insert_or_update_repo(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Metagit)
             .await?;
         let entry = push
             .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
@@ -258,7 +317,7 @@ mod test {
         assert_eq!(entry.source_of_truth, GitSourceOfTruth::Metagit);
 
         // update it
-        push.set(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
+        push.insert_or_update_repo(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
             .await?;
         let entry = push
             .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
@@ -266,6 +325,243 @@ mod test {
         assert!(entry.is_some());
         let entry = entry.unwrap();
         assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_insert_repos(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let builder = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?;
+        let push = builder.clone().build();
+
+        // insert many
+        push.insert_repos(
+            &ctx,
+            &[
+                (
+                    RepositoryId::new(1),
+                    RepositoryName("test1".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+                (
+                    RepositoryId::new(2),
+                    RepositoryName("test2".to_string()),
+                    GitSourceOfTruth::Metagit,
+                ),
+                (
+                    RepositoryId::new(3),
+                    RepositoryName("test3".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+            ],
+        )
+        .await?;
+
+        // get each and confirm it worked
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test1".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test2".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Metagit);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test3".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        // update many should fail if any id is not unique as we don't allow duplicate ids
+        let result = push
+            .insert_repos(
+                &ctx,
+                &[
+                    (
+                        RepositoryId::new(2),
+                        RepositoryName("test2_renamed".to_string()),
+                        GitSourceOfTruth::Mononoke,
+                    ),
+                    (
+                        RepositoryId::new(4),
+                        RepositoryName("test4".to_string()),
+                        GitSourceOfTruth::Metagit,
+                    ),
+                ],
+            )
+            .await;
+        assert!(result.is_err());
+        let error_trace = format!("{:#}", result.unwrap_err());
+        assert!(error_trace.contains("UNIQUE constraint failed"));
+        assert!(error_trace.contains("git_repositories_source_of_truth.repo_id"));
+
+        // update many should fail if any name is not unique
+        let result = push
+            .insert_repos(
+                &ctx,
+                &[(
+                    RepositoryId::new(4),
+                    RepositoryName("test2".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                )],
+            )
+            .await;
+        assert!(result.is_err());
+        let error_trace = format!("{:#}", result.unwrap_err());
+        assert!(error_trace.contains("UNIQUE constraint failed"));
+        assert!(error_trace.contains("git_repositories_source_of_truth.repo_name"));
+
+        // insert many new repos should succeed
+        push.insert_repos(
+            &ctx,
+            &[
+                (
+                    RepositoryId::new(4),
+                    RepositoryName("test4".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+                (
+                    RepositoryId::new(5),
+                    RepositoryName("test5".to_string()),
+                    GitSourceOfTruth::Metagit,
+                ),
+            ],
+        )
+        .await?;
+
+        // get each and confirm it worked
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test4".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test5".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Metagit);
+
+        Ok(())
+    }
+
+    #[mononoke::fbinit_test]
+    async fn test_update_source_of_truth_by_repo_names(fb: FacebookInit) -> Result<()> {
+        let ctx = CoreContext::test_mock(fb);
+        let builder = SqlGitSourceOfTruthConfigBuilder::with_sqlite_in_memory()?;
+        let push = builder.clone().build();
+
+        // insert many
+        push.insert_repos(
+            &ctx,
+            &[
+                (
+                    RepositoryId::new(1),
+                    RepositoryName("test1".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+                (
+                    RepositoryId::new(2),
+                    RepositoryName("test2".to_string()),
+                    GitSourceOfTruth::Metagit,
+                ),
+                (
+                    RepositoryId::new(3),
+                    RepositoryName("test3".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+                (
+                    RepositoryId::new(4),
+                    RepositoryName("test4".to_string()),
+                    GitSourceOfTruth::Mononoke,
+                ),
+            ],
+        )
+        .await?;
+
+        push.update_source_of_truth_by_repo_names(
+            &ctx,
+            GitSourceOfTruth::Metagit,
+            &[
+                RepositoryName("test2".to_string()),
+                RepositoryName("test4".to_string()),
+            ],
+        )
+        .await?;
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test1".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test2".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Metagit);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test3".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Mononoke);
+
+        let entry = push
+            .get_by_repo_name(
+                &ctx,
+                &RepositoryName("test4".to_string()),
+                Staleness::MostRecent,
+            )
+            .await?;
+        assert!(entry.is_some());
+        let entry = entry.unwrap();
+        assert_eq!(entry.source_of_truth, GitSourceOfTruth::Metagit);
 
         Ok(())
     }
@@ -283,7 +579,7 @@ mod test {
             .await?;
         assert!(entry.is_none());
 
-        push.set(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
+        push.insert_or_update_repo(&ctx, repo_id, repo_name.clone(), GitSourceOfTruth::Mononoke)
             .await?;
         let entry = push
             .get_by_repo_name(&ctx, &repo_name, Staleness::MostRecent)
@@ -303,21 +599,21 @@ mod test {
 
         let to_be_redirected_to_mononoke_repo_id = RepositoryId::new(1);
         let to_be_redirected_to_mononoke_repo_name = RepositoryName("test1".to_string());
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             to_be_redirected_to_mononoke_repo_id,
             to_be_redirected_to_mononoke_repo_name.clone(),
             GitSourceOfTruth::Metagit,
         )
         .await?;
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             RepositoryId::new(2),
             RepositoryName("test2".to_string()),
             GitSourceOfTruth::Mononoke,
         )
         .await?;
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             RepositoryId::new(3),
             RepositoryName("test3".to_string()),
@@ -328,7 +624,7 @@ mod test {
         assert_eq!(push.get_redirected_to_mononoke(&ctx).await?.len(), 1);
         assert_eq!(push.get_redirected_to_metagit(&ctx).await?.len(), 2);
 
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             to_be_redirected_to_mononoke_repo_id,
             to_be_redirected_to_mononoke_repo_name,
@@ -350,14 +646,14 @@ mod test {
 
         let to_be_locked_repo_id = RepositoryId::new(1);
         let to_be_locked_repo_name = RepositoryName("test1".to_string());
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             to_be_locked_repo_id,
             to_be_locked_repo_name.clone(),
             GitSourceOfTruth::Locked,
         )
         .await?;
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             RepositoryId::new(2),
             RepositoryName("test2".to_string()),
@@ -378,14 +674,14 @@ mod test {
         assert_eq!(push.get_max_id(&ctx).await?, None);
         let to_be_locked_repo_id = RepositoryId::new(1);
         let to_be_locked_repo_name = RepositoryName("test1".to_string());
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             to_be_locked_repo_id,
             to_be_locked_repo_name.clone(),
             GitSourceOfTruth::Metagit,
         )
         .await?;
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             RepositoryId::new(2),
             RepositoryName("test2".to_string()),
@@ -393,7 +689,7 @@ mod test {
         )
         .await?;
         assert_eq!(push.get_max_id(&ctx).await?, Some(RepositoryId::new(2)));
-        push.set(
+        push.insert_or_update_repo(
             &ctx,
             RepositoryId::new(42),
             RepositoryName("test3".to_string()),

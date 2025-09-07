@@ -65,7 +65,7 @@ repo root. The ``[dirsync-scripts]`` in ``.hgdirsync`` is ignored by default,
 unless the ``dirsync.allow-in-repo-scripts`` config is enabled.
 """
 
-from typing import Optional, Sized
+from typing import Optional
 
 import bindings
 
@@ -500,7 +500,7 @@ def dirsyncctx(ctx, matcher=None):
                                 % type(dst_data)
                             )
                         fmirror = context.overlayfilectx(
-                            fmirror, datafunc=lambda: dst_data
+                            fmirror, datafunc=lambda data=dst_data: data
                         )
 
                 mctx[dst] = fmirror

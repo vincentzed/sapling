@@ -126,7 +126,7 @@ impl<R: Repo> CandidateSelectionHint<R> {
                 let maybe_target_cs_id: Option<Target<ChangesetId>> = target_repo
                     .0
                     .bookmarks()
-                    .get(ctx.clone(), &bookmark.0)
+                    .get(ctx.clone(), &bookmark.0, bookmarks::Freshness::MostRecent)
                     .await?
                     .map(Target);
 
@@ -138,7 +138,7 @@ impl<R: Repo> CandidateSelectionHint<R> {
                 let maybe_target_cs_id: Option<Target<ChangesetId>> = target_repo
                     .0
                     .bookmarks()
-                    .get(ctx.clone(), &bookmark.0)
+                    .get(ctx.clone(), &bookmark.0, bookmarks::Freshness::MostRecent)
                     .await?
                     .map(Target);
 

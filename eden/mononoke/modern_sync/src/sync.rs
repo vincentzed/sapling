@@ -700,7 +700,11 @@ pub async fn process_one_changeset(
     if log_to_ods {
         let lag = if let Some(cs_id) = repo
             .bookmarks()
-            .get(ctx.clone(), &BookmarkKey::new(bookmark_name)?)
+            .get(
+                ctx.clone(),
+                &BookmarkKey::new(bookmark_name)?,
+                bookmarks::Freshness::MaybeStale,
+            )
             .await?
         {
             let bookmark_commit = cs_id.load(ctx, repo.repo_blobstore()).await?;

@@ -6,6 +6,7 @@
  */
 
 use std::io::ErrorKind;
+use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic;
@@ -18,11 +19,13 @@ use configmodel::convert::ByteCount;
 use indexedlog::OpenWithRepair;
 use indexedlog::Result as IndexedlogResult;
 use indexedlog::log;
+use indexedlog::log::ExtendWrite;
 use indexedlog::log::IndexDef;
 use indexedlog::log::IndexOutput;
 use indexedlog::log::Log;
 use indexedlog::log::LogLookupIter;
 use indexedlog::rotate;
+use indexedlog::rotate::ConsistentReadGuard;
 use indexedlog::rotate::RotateLog;
 use indexedlog::rotate::RotateLogLookupIter;
 use minibytes::Bytes;
@@ -40,6 +43,7 @@ pub struct Store {
     auto_sync_count: AtomicU64,
     // Configured by scmstore.sync-logs-if-changed-on-disk (defaults to disabled if not configured).
     sync_if_changed_on_disk: bool,
+    should_compress: bool,
 }
 
 pub enum Inner {
@@ -71,17 +75,26 @@ impl Store {
         self.write().append(buf)
     }
 
+    /// Write to the store directly.
+    pub fn append_direct(&self, cb: impl Fn(&mut dyn ExtendWrite) -> Result<()>) -> Result<()> {
+        self.write().append_direct(cb)
+    }
+
     /// Attempt to make slice backed by the mmap buffer to avoid heap allocation.
     pub fn slice_to_bytes(&self, slice: &[u8]) -> Bytes {
         self.read().slice_to_bytes(slice)
     }
 
+    pub fn should_compress(&self) -> bool {
+        self.should_compress
+    }
+
     /// Append a batch of items to the store. This is optimized to reduce lock churn, which helps a
     /// lot when there is multi-threaded contention.
-    pub fn append_batch<K: AsRef<[u8]>, V>(
+    pub fn append_batch<K: AsRef<[u8]> + Copy, V>(
         &self,
         mut items: Vec<(K, V)>,
-        serialize: impl Fn(K, &V, &mut Vec<u8>) -> Result<()>,
+        serialize: impl Fn(K, &V, &mut dyn Write) -> Result<()>,
         // Filter out items already present in the store before inserting.
         read_before_write: bool,
     ) -> Result<()> {
@@ -105,26 +118,10 @@ impl Store {
             items.truncate(insert_idx);
         }
 
-        // Pre-serialize all the items into a single buffer. This reduces allocations and minimizes
-        // the work we do inside the critical write lock section below (at the cost of using more
-        // memory).
-
-        // Buffer to hold all the items' serialized data.
-        let mut buf = Vec::new();
-        // Indexes of the ends of each item within buf.
-        let mut ends = Vec::with_capacity(items.len());
-
-        for (k, v) in items {
-            serialize(k, &v, &mut buf)?;
-            ends.push(buf.len());
-        }
-
         let mut log = self.write();
 
-        let mut start = 0;
-        for end in ends {
-            log.append(&buf[start..end])?;
-            start = end;
+        for (k, v) in items {
+            log.append_direct(|buf| serialize(k, &v, buf))?;
         }
 
         Ok(())
@@ -172,7 +169,7 @@ impl Inner {
 
     /// Find the key in the store. Returns an `Iterator` over all the values that this store
     /// contains for the key.
-    pub fn lookup(&self, index_id: usize, key: impl AsRef<[u8]>) -> Result<LookupIter> {
+    pub fn lookup(&self, index_id: usize, key: impl AsRef<[u8]>) -> Result<LookupIter<'_>> {
         let key = key.as_ref();
         match self {
             Self::Permanent(log) => Ok(LookupIter::Permanent(log.lookup(index_id, key)?)),
@@ -192,6 +189,13 @@ impl Inner {
         match self {
             Self::Permanent(log) => Ok(log.append(buf)?),
             Self::Rotated(log) => Ok(log.append(buf)?),
+        }
+    }
+
+    pub fn append_direct(&mut self, cb: impl Fn(&mut dyn ExtendWrite) -> Result<()>) -> Result<()> {
+        match self {
+            Self::Permanent(log) => Ok(log.append_direct(cb)?),
+            Self::Rotated(log) => Ok(log.append_direct(cb)?),
         }
     }
 
@@ -238,6 +242,13 @@ impl Inner {
             Self::Rotated(log) => log.is_changed_on_disk(),
         }
     }
+
+    pub(crate) fn with_consistent_reads(&mut self) -> Option<ConsistentReadGuard> {
+        match self {
+            Inner::Permanent(_log) => None,
+            Inner::Rotated(rotate_log) => Some(rotate_log.with_consistent_reads()),
+        }
+    }
 }
 
 /// Iterator returned from `Self::lookup`.
@@ -273,6 +284,7 @@ pub struct StoreOpenOptions {
     pub max_bytes_per_log: Option<u64>,
     indexes: Vec<IndexDef>,
     create: bool,
+    btrfs_compression: bool,
 }
 
 impl StoreOpenOptions {
@@ -286,6 +298,7 @@ impl StoreOpenOptions {
             sync_if_changed_on_disk: config
                 .must_get("scmstore", "sync-logs-if-changed-on-disk")
                 .unwrap_or_default(),
+            btrfs_compression: false,
         }
     }
 
@@ -305,6 +318,7 @@ impl StoreOpenOptions {
         {
             self.max_log_count = Some(v)
         }
+
         self
     }
 
@@ -333,6 +347,12 @@ impl StoreOpenOptions {
         self
     }
 
+    /// Rely on btrfs compression.
+    pub fn btrfs_compression(mut self, btrfs: bool) -> Self {
+        self.btrfs_compression = btrfs;
+        self
+    }
+
     pub fn create(mut self, create: bool) -> Self {
         self.create = create;
         self
@@ -351,13 +371,16 @@ impl StoreOpenOptions {
     /// data consistency.
     pub fn permanent(self, path: impl AsRef<Path>) -> Result<Store> {
         let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
+        let should_compress = self.should_compress(path.as_ref())?;
         Ok(Store {
             inner: RwLock::new(Inner::Permanent(
                 self.into_permanent_open_options()
+                    .btrfs_compression(!should_compress)
                     .open_with_repair(path.as_ref())?,
             )),
             auto_sync_count: AtomicU64::new(0),
             sync_if_changed_on_disk,
+            should_compress,
         })
     }
 
@@ -387,7 +410,10 @@ impl StoreOpenOptions {
     /// and `max_bytes_per_log`.
     pub fn rotated(self, path: impl AsRef<Path>) -> Result<Store> {
         let sync_if_changed_on_disk = self.sync_if_changed_on_disk;
-        let opts = self.into_rotated_open_options();
+        let should_compress = self.should_compress(path.as_ref())?;
+        let opts = self
+            .into_rotated_open_options()
+            .btrfs_compression(!should_compress);
         let mut rotate_log = opts.open_with_repair(path.as_ref())?;
         // Attempt to clean up old logs that might be left around. On Windows, other
         // Mercurial processes that have the store opened might prevent their removal.
@@ -399,6 +425,7 @@ impl StoreOpenOptions {
             inner: RwLock::new(Inner::Rotated(rotate_log)),
             auto_sync_count: AtomicU64::new(0),
             sync_if_changed_on_disk,
+            should_compress,
         })
     }
 
@@ -421,6 +448,24 @@ impl StoreOpenOptions {
         self.into_rotated_open_options()
             .repair(path)
             .map_err(|e| e.into())
+    }
+
+    fn should_compress(&self, path: &Path) -> Result<bool> {
+        Ok(!self.btrfs_compression || !is_btrfs(path))
+    }
+}
+
+fn is_btrfs(path: &Path) -> bool {
+    if cfg!(target_os = "linux") {
+        match fsinfo::fstype(path) {
+            Ok(fstype) => fstype == fsinfo::FsType::BTRFS,
+            Err(err) => {
+                tracing::error!(?err, "error detecting filesystem type for btrfs decision");
+                false
+            }
+        }
+    } else {
+        false
     }
 }
 

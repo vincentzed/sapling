@@ -6,8 +6,10 @@
 # pyre-unsafe
 
 
+import abc
+import configparser
 import os
-from pathlib import Path
+import time
 from typing import Optional, Set
 
 from eden.integration.hg.lib.hg_extension_test_base import (
@@ -17,9 +19,7 @@ from eden.integration.hg.lib.hg_extension_test_base import (
 from eden.integration.lib import hgrepo
 
 
-@filteredhg_test
-# pyre-ignore[13]: T62487924
-class FilteredFSBase(FilteredHgTestCase):
+class FilteredFSBase(FilteredHgTestCase, metaclass=abc.ABCMeta):
     """Exercise some fundamental operations with filters enabled/disabled."""
 
     testFilterEmpty: str = ""
@@ -63,7 +63,6 @@ bdir
 bdir/README.md
 """
 
-    # pyre-fixme[13]: Attribute `initial_commit` is never initialized.
     initial_commit: str
 
     def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
@@ -148,6 +147,10 @@ bdir/README.md
     def show_active_filter(self) -> str:
         return self.hg("filteredfs", "show")
 
+
+@filteredhg_test
+# pyre-ignore[13]: T62487924
+class FilteredFSBasic(FilteredFSBase):
     def test_filter_enable(self) -> None:
         self.set_active_filter("top_level_filter")
         self.assertEqual(self.get_active_filter_path(), "top_level_filter")
@@ -372,3 +375,79 @@ bdir/README.md
 
         # The newly unfiltered files should be unfiltered
         self.ensure_filtered_and_unfiltered(set(), {"dir2/not_filtered", "dir2/README"})
+
+
+@filteredhg_test
+# pyre-ignore[13]: T62487924
+class FilteredFSRepoCacheTest(FilteredFSBase):
+    def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
+        super().populate_backing_repo(repo)
+
+    def apply_hg_config_variant(self, hgrc: configparser.ConfigParser) -> None:
+        super().apply_hg_config_variant(hgrc)
+        hgrc["edenfs"] = {"ffs-repo-cache-ttl": "2s"}
+
+    def test_repo_cache_eviction(self) -> None:
+        """Test that repos are evicted from cache after TTL expires."""
+        # Check initial counters
+        counters_initial = self.get_counters()
+        initial_cache_cleanups = counters_initial.get(
+            "edenffi.ffs.repo_cache_cleanups", 0
+        )
+
+        # Make an initial request to populate the cache
+        self.set_active_filter("top_level_filter")
+
+        counters_intermediate = self.get_counters()
+        intermediate_cache_cleanups = counters_intermediate.get(
+            "edenffi.ffs.repo_cache_cleanups", 0
+        )
+        self.assertEqual(initial_cache_cleanups, intermediate_cache_cleanups)
+
+        # Wait for the TTL to expire (2 seconds + 15 second buffer for cleanup thread)
+        time.sleep(17)
+
+        # Make another request - this should be a cache miss since the entry expired
+        # and the cleanup thread should have removed it
+        self.set_active_filter("top_level_filter")
+
+        counters_final = self.get_counters()
+        final_cache_cleanups = counters_final.get("edenffi.ffs.repo_cache_cleanups", 0)
+
+        # We should see cache cleanups have occurred
+        self.assertGreater(final_cache_cleanups, initial_cache_cleanups)
+
+
+@filteredhg_test
+# pyre-ignore[13]: T62487924
+class FilteredFSRepoCacheNeverExpiresTest(FilteredFSBase):
+    def populate_backing_repo(self, repo: hgrepo.HgRepository) -> None:
+        super().populate_backing_repo(repo)
+
+    def apply_hg_config_variant(self, hgrc: configparser.ConfigParser) -> None:
+        super().apply_hg_config_variant(hgrc)
+        hgrc["edenfs"] = {"ffs-repo-cache-ttl": "0s"}
+
+    def test_repo_cache_eviction_never_expires(self) -> None:
+        """Test that repos are evicted from cache after TTL expires."""
+        # Check initial counters
+        counters_initial = self.get_counters()
+        initial_cache_cleanups = counters_initial.get(
+            "edenffi.ffs.repo_cache_cleanups", 0
+        )
+
+        # Make an initial request to populate the cache
+        self.set_active_filter("top_level_filter")
+
+        # Wait for the TTL to expire (2 seconds + 15 second buffer for cleanup thread)
+        time.sleep(17)
+
+        # Make another request - this should be a cache miss since the entry expired
+        # and the cleanup thread should have removed it
+        self.set_active_filter("top_level_filter")
+
+        counters_final = self.get_counters()
+        final_cache_cleanups = counters_final.get("edenffi.ffs.repo_cache_cleanups", 0)
+
+        # We should see cache cleanups have occurred
+        self.assertEqual(final_cache_cleanups, initial_cache_cleanups)

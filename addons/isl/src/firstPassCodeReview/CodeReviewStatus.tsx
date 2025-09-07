@@ -7,21 +7,53 @@
 
 import {Banner, BannerKind} from 'isl-components/Banner';
 import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
+import {atom, useAtom, useAtomValue} from 'jotai';
+import clientToServerAPI from '../ClientToServerAPI';
 import {T} from '../i18n';
-import {runCodeReview} from './runCodeReview';
-import {useAtomValue} from 'jotai';
+import {atomFamilyWeak} from '../jotaiUtils';
 import {serverCwd} from '../repositoryData';
+import type {CommitInfo, Hash} from '../types';
+import {runCodeReview} from './runCodeReview';
 
 import './CodeReviewStatus.css';
-import clientToServerAPI from '../ClientToServerAPI';
-import {useState} from 'react';
-import {Icon} from 'isl-components/Icon';
 
 type CodeReviewProgressStatus = 'running' | 'success' | 'error';
 
-export function CodeReviewStatus(): JSX.Element {
+/**
+ * Atom family to store code review status per commit hash.
+ * Each commit gets its own atom to track its code review progress.
+ */
+const codeReviewStatusAtom = atomFamilyWeak((_hash: Hash) =>
+  atom<CodeReviewProgressStatus | null>(null),
+);
+
+export function CodeReviewStatus({commit}: {commit: CommitInfo}): JSX.Element {
   const cwd = useAtomValue(serverCwd);
-  const [status, setStatus] = useState<CodeReviewProgressStatus | null>(null);
+  const [status, setStatus] = useAtom(codeReviewStatusAtom(commit.hash));
+
+  const button = (
+    <Button
+      onClick={async () => {
+        let results;
+        setStatus('running');
+        try {
+          results = await runCodeReview(cwd);
+        } catch (e) {
+          setStatus('error');
+          return;
+        }
+        clientToServerAPI.postMessage({
+          type: 'platform/setFirstPassCodeReviewDiagnostics',
+          issueMap: results,
+        });
+        setStatus('success');
+      }}
+      disabled={!commit.isDot}>
+      {status == null ? <T>Try it!</T> : <T>Try again</T>}
+    </Button>
+  );
 
   return (
     <Banner kind={getBannerKind(status)}>
@@ -31,25 +63,10 @@ export function CodeReviewStatus(): JSX.Element {
         </b>
         {status === 'running' ? (
           <Icon icon="loading" />
+        ) : commit.isDot ? (
+          button
         ) : (
-          <Button
-            onClick={async () => {
-              let results;
-              setStatus('running');
-              try {
-                results = await runCodeReview(cwd);
-              } catch (e) {
-                setStatus('error');
-                return;
-              }
-              clientToServerAPI.postMessage({
-                type: 'platform/setFirstPassCodeReviewDiagnostics',
-                issueMap: results,
-              });
-              setStatus('success');
-            }}>
-            {status == null ? <T>Try it!</T> : <T>Try again</T>}
-          </Button>
+          <Tooltip title="This action is only available for the current commit.">{button}</Tooltip>
         )}
       </div>
     </Banner>

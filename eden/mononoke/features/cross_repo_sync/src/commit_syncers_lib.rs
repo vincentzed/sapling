@@ -397,7 +397,11 @@ where
     // it might be a bit stale.
     let target_bookmark_csid = target_repo
         .bookmarks()
-        .get(ctx.clone(), &target_bookmark.0)
+        .get(
+            ctx.clone(),
+            &target_bookmark.0,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| anyhow!("Bookmark {} does not exist", target_bookmark.0))?;
 
@@ -539,7 +543,11 @@ where
     // it might be a bit stale.
     let target_bookmark_csid = target_repo
         .bookmarks()
-        .get(ctx.clone(), &target_bookmark.0)
+        .get(
+            ctx.clone(),
+            &target_bookmark.0,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| anyhow!("Bookmark {} does not exist", target_bookmark.0))?;
 

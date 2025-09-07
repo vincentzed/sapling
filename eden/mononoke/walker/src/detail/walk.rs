@@ -294,7 +294,17 @@ async fn bookmark_step<V: VisitOne>(
     let bcs_opt = match published_bookmarks.get(&b) {
         Some(csid) => Some(csid.clone()),
         // Just in case we have non-public bookmarks
-        None => repo.bookmarks().get(ctx, &b).await?,
+        None => {
+            repo.bookmarks()
+                .get(
+                    ctx,
+                    &b,
+                    // Staleness is rarely close to 1s, so the walker should
+                    // be able to read bookmark values from replicas
+                    bookmarks::Freshness::MaybeStale,
+                )
+                .await?
+        }
     };
     match bcs_opt {
         Some(bcs_id) => {

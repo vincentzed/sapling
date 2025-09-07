@@ -106,10 +106,10 @@ import {FillCommitMessage} from './FillCommitMessage';
 import {CommitTitleByline, getFieldToAutofocus, Section, SmallCapsTitle} from './utils';
 
 import {useFeatureFlagSync} from '../featureFlags';
+import {CodeReviewStatus} from '../firstPassCodeReview/CodeReviewStatus';
 import {Internal} from '../Internal';
 import {confirmSuggestedEditsForFiles} from '../SuggestedEdits';
 import './CommitInfoView.css';
-import {CodeReviewStatus} from '../firstPassCodeReview/CodeReviewStatus';
 
 export function CommitInfoSidebar() {
   const commitsToShow = useAtomValue(commitInfoViewCurrentCommits);
@@ -422,7 +422,7 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             <FoldPreviewActions />
           ) : (
             <>
-              {aiFirstPassCodeReviewEnabled && <CodeReviewStatus />}
+              {aiFirstPassCodeReviewEnabled && <CodeReviewStatus commit={commit} />}
               <ActionsBar
                 commit={commit}
                 latestMessage={parsedFields}

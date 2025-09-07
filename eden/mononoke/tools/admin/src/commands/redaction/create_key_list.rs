@@ -230,7 +230,11 @@ pub async fn create_key_list_from_commit_files(
     );
     let main_cs_id = repo
         .bookmarks()
-        .get(ctx.clone(), &create_args.main_bookmark)
+        .get(
+            ctx.clone(),
+            &create_args.main_bookmark,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| {
             anyhow!(

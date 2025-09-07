@@ -29,12 +29,10 @@ import hashlib
 import logging
 import re
 import shutil
-import socket
 import stat
 import struct
 import subprocess
 import tempfile
-import time
 from sysconfig import get_platform
 
 from contrib.pick_python import load_build_env
@@ -80,18 +78,13 @@ def filter(f, it):
     return list(__builtins__.filter(f, it))
 
 
-from distutils import file_util
 from distutils.ccompiler import new_compiler
 
 from distutils.command.build import build
-from distutils.command.build_clib import build_clib
 from distutils.command.build_scripts import build_scripts
 from distutils.command.install import install
-from distutils.command.install_lib import install_lib
 from distutils.command.install_scripts import install_scripts
 from distutils.core import Command, setup
-from distutils.dep_util import newer_group
-from distutils.errors import DistutilsSetupError
 from distutils.spawn import spawn
 
 from distutils_rust import BuildRustExt, InstallRustExt, RustBinary
@@ -448,86 +441,6 @@ if not isinstance(sapling_versionb, bytes):
 sapling_versionhash = str(
     struct.unpack(">Q", hashlib.sha1(sapling_versionb).digest()[:8])[0]
 )
-sapling_versionhashb = sapling_versionhash.encode("ascii")
-
-chgcflags = ["-std=c99", "-D_GNU_SOURCE", "-DHAVE_VERSIONHASH", "-I%s" % builddir]
-versionhashpath = pjoin(builddir, "versionhash.h")
-write_if_changed(
-    versionhashpath, b"#define HGVERSIONHASH %sULL\n" % sapling_versionhashb
-)
-
-
-def writebuildinfoc():
-    """Write build/buildinfo.c"""
-    commithash = hgtemplate("{node}")
-    commitunixtime = hgtemplate('{sub("[^0-9].*","",date)}', cast=int)
-
-    # Search 'extractBuildInfoFromELF' in fbcode for supported fields.
-    buildinfo = {
-        "Host": socket.gethostname(),
-        "PackageName": os.environ.get("RPM_PACKAGE_NAME")
-        or os.environ.get("PACKAGE_NAME"),
-        "PackageRelease": os.environ.get("RPM_PACKAGE_RELEASE")
-        or os.environ.get("PACKAGE_RELEASE"),
-        "PackageVersion": os.environ.get("RPM_PACKAGE_VERSION")
-        or os.environ.get("PACKAGE_VERSION"),
-        "Path": os.getcwd(),
-        "Platform": os.environ.get("RPM_OS"),
-        "Revision": commithash,
-        "RevisionCommitTimeUnix": commitunixtime,
-        "TimeUnix": int(time.time()),
-        "UpstreamRevision": commithash,
-        "UpstreamRevisionCommitTimeUnix": commitunixtime,
-        "User": os.environ.get("USER"),
-    }
-
-    buildinfosrc = """
-#include <stdio.h>
-#include <time.h>
-"""
-    for name, value in sorted(buildinfo.items()):
-        if isinstance(value, str):
-            buildinfosrc += 'const char *BuildInfo_k%s = "%s";\n' % (
-                name,
-                value.replace('"', '\\"'),
-            )
-        elif isinstance(value, int):
-            # The only usage of int is timestamp
-            buildinfosrc += "const time_t BuildInfo_k%s = %d;\n" % (name, value)
-
-    buildinfosrc += """
-/* This function keeps references of the symbols and prevents them from being
- * optimized out if this function is used. */
-void print_buildinfo() {
-"""
-    for name, value in sorted(buildinfo.items()):
-        if isinstance(value, str):
-            buildinfosrc += (
-                '  fprintf(stderr, "%(name)s: %%s (at %%p)\\n", BuildInfo_k%(name)s, BuildInfo_k%(name)s);\n'
-                % {"name": name}
-            )
-        elif isinstance(value, int):
-            buildinfosrc += (
-                '  fprintf(stderr, "%(name)s: %%lu (at %%p)\\n", (long unsigned)BuildInfo_k%(name)s, &BuildInfo_k%(name)s) ;\n'
-                % {"name": name}
-            )
-    buildinfosrc += """
-}
-"""
-
-    path = pjoin(builddir, "buildinfo.c")
-    write_if_changed(path, buildinfosrc.encode())
-    return path
-
-
-# If NEED_BUILDINFO is set, write buildinfo.
-# For rpmbuild, imply NEED_BUILDINFO.
-needbuildinfo = bool(
-    os.environ.get("NEED_BUILDINFO", "RPM_PACKAGE_NAME" in os.environ and not ossbuild)
-)
-
-if needbuildinfo:
-    buildinfocpath = writebuildinfoc()
 
 
 class hgbuild(build):
@@ -764,43 +677,6 @@ class hginstall(install):
         return filter(lambda x: x not in excl, install.get_sub_commands(self))
 
 
-class hginstalllib(install_lib):
-    """
-    This is a specialization of install_lib that replaces the copy_file used
-    there so that it supports setting the mode of files after copying them,
-    instead of just preserving the mode that the files originally had.  If your
-    system has a umask of something like 027, preserving the permissions when
-    copying will lead to a broken install.
-
-    Note that just passing keep_permissions=False to copy_file would be
-    insufficient, as it might still be applying a umask.
-    """
-
-    def run(self):
-        realcopyfile = file_util.copy_file
-
-        def copyfileandsetmode(*args, **kwargs):
-            src, dst = args[0], args[1]
-            dst, copied = realcopyfile(*args, **kwargs)
-            if copied:
-                st = os.stat(src)
-                # Persist executable bit (apply it to group and other if user
-                # has it)
-                if st[stat.ST_MODE] & stat.S_IXUSR:
-                    setmode = int("0755", 8)
-                else:
-                    setmode = int("0644", 8)
-                m = stat.S_IMODE(st[stat.ST_MODE])
-                m = (m & ~int("0777", 8)) | setmode
-                os.chmod(dst, m)
-
-        file_util.copy_file = copyfileandsetmode
-        try:
-            install_lib.run(self)
-        finally:
-            file_util.copy_file = realcopyfile
-
-
 class hginstallscripts(install_scripts):
     """
     This is a specialization of install_scripts that replaces the @LIBDIR@ with
@@ -881,7 +757,6 @@ cmdclass = {
     "build_mo": hgbuildmo,
     "build_scripts": hgbuildscripts,
     "install": hginstall,
-    "install_lib": hginstalllib,
     "install_scripts": hginstallscripts,
     "build_rust_ext": BuildRustExt,
     "build_embedded": buildembedded,
@@ -980,54 +855,7 @@ havefanotify = (
 extmodules = []
 
 
-libraries = [
-    (
-        "mpatch",
-        {
-            "sources": ["sapling/mpatch.c"],
-            "depends": [
-                "sapling/bitmanipulation.h",
-                "sapling/compat.h",
-                "sapling/mpatch.h",
-            ],
-            "include_dirs": ["."] + include_dirs,
-        },
-    ),
-]
-if needbuildinfo:
-    libraries += [
-        (
-            "buildinfo",
-            {
-                "sources": [buildinfocpath],
-                "extra_args": filter(None, cflags + [WALL, PIC]),
-            },
-        )
-    ]
-
-if not iswindows:
-    libraries.append(
-        (
-            "chg",
-            {
-                "sources": [
-                    "contrib/chg/chg.c",
-                    "contrib/chg/hgclient.c",
-                    "contrib/chg/procutil.c",
-                    "contrib/chg/util.c",
-                ],
-                "depends": [versionhashpath],
-                "include_dirs": ["contrib/chg"] + include_dirs,
-                "extra_args": filter(None, cflags + chgcflags + [STDC99, WALL, PIC]),
-                # chg uses libc::unistd/getgroups() to check that chg and the
-                # sl cli have the same permissions (see D43676809).
-                # However, on macOS, getgroups() is limited to NGROUPS_MAX (16) groups by default.
-                # We can work around this by defining _DARWIN_UNLIMITED_GETGROUPS
-                # see https://opensource.apple.com/source/xnu/xnu-3247.1.106/bsd/man/man2/getgroups.2.auto.html
-                "macros": [("_DARWIN_UNLIMITED_GETGROUPS", "1")],
-            },
-        )
-    )
+libraries = []
 
 # let's add EXTRA_LIBS to every buildable
 for extmodule in extmodules:
@@ -1093,62 +921,11 @@ def ordinarypath(p):
     return p and p[0] != "." and p[-1] != "~"
 
 
-def build_libraries(self, libraries):
-    for lib_name, build_info in libraries:
-        sources = build_info.get("sources")
-        if sources is None or not isinstance(sources, (list, tuple)):
-            raise (
-                DistutilsSetupError(
-                    "in 'libraries' option (library '%s'), "
-                    + "'sources' must be present and must be "
-                    + "a list of source filenames"
-                )
-                % lib_name
-            )
-        sources = list(sources)
-
-        lib_path = self.compiler.library_filename(lib_name, output_dir=self.build_clib)
-        depends = sources + build_info.get("depends", [])
-        if not (self.force or newer_group(depends, lib_path, "newer")):
-            log.debug("skipping '%s' library (up-to-date)", lib_name)
-            continue
-        else:
-            log.info("building '%s' library" % lib_name)
-
-        # First, compile the source code to object files in the library
-        # directory.  (This should probably change to putting object
-        # files in a temporary build directory.)
-        macros = build_info.get("macros", [])
-        include_dirs = build_info.get("include_dirs")
-        extra_args = build_info.get("extra_args")
-        objects = self.compiler.compile(
-            sources,
-            output_dir=self.build_temp,
-            macros=macros,
-            include_dirs=include_dirs,
-            debug=self.debug,
-            extra_postargs=extra_args,
-        )
-
-        # Now "link" the object files together into a static library.
-        # (On Unix at least, this isn't really linking -- it just
-        # builds an archive.  Whatever.)
-        libraries = build_info.get("libraries", [])
-        for lib in libraries:
-            self.compiler.add_library(lib)
-        self.compiler.create_static_lib(
-            objects, lib_name, output_dir=self.build_clib, debug=self.debug
-        )
-
-
-build_clib.build_libraries = build_libraries
-
 hgmainfeatures = (
     " ".join(
         filter(
             None,
             [
-                "buildinfo" if needbuildinfo else None,
                 "with_chg" if not iswindows else None,
                 "fb" if havefb else None,
                 "eden" if not ossbuild else None,

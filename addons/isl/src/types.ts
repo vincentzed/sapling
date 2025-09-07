@@ -16,9 +16,9 @@ import type {Hash} from 'shared/types/common';
 import type {ExportStack, ImportedStack, ImportStack} from 'shared/types/stack';
 import type {TypeaheadKind} from './CommitInfoView/types';
 import type {InternalTypes} from './InternalTypes';
+import type {CodeReviewIssue} from './firstPassCodeReview/types';
 import type {Serializable} from './serialize';
 import type {Args, DiffCommit, PartiallySelectedDiffCommit} from './stackEdit/diffSplitTypes';
-import type {CodeReviewIssue} from './firstPassCodeReview/types';
 
 export type Result<T> = {value: T; error?: undefined} | {value?: undefined; error: Error};
 
@@ -116,6 +116,12 @@ export enum ArchivedReasonType {
   STALE_FILE_CHANGED = 'STALE_FILE_CHANGED',
 }
 
+export enum WarningCheckResult {
+  PASS = 'PASS',
+  FAIL = 'FAIL',
+  BYPASS = 'BYPASS',
+}
+
 export type CodeChange = {
   oldContent?: string;
   newContent?: string;
@@ -167,7 +173,13 @@ export type DiffComment = {
  * 'pass' if ALL signals succeed and not still running.
  * 'failed' if ANY signal doesn't succeed, even if some are still running.
  */
-export type DiffSignalSummary = 'running' | 'pass' | 'failed' | 'warning' | 'no-signal';
+export type DiffSignalSummary =
+  | 'running'
+  | 'pass'
+  | 'failed'
+  | 'warning'
+  | 'no-signal'
+  | 'land-cancelled';
 
 /**
  * Information about a land request, specific to each Code Review Provider.
@@ -731,6 +743,10 @@ export type PlatformSpecificClientToServerMessages =
     }
   | {
       type: 'platform/devmateValidateChanges';
+    }
+  | {
+      type: 'platform/devmateResolveAllConflicts';
+      conflicts: MergeConflicts;
     };
 
 /**
@@ -931,6 +947,7 @@ export type ClientToServerMessage =
   | {type: 'importStack'; stack: ImportStack}
   | {type: 'fetchQeFlag'; name: string}
   | {type: 'fetchFeatureFlag'; name: string}
+  | {type: 'bulkFetchFeatureFlags'; id: string; names: Array<string>}
   | {type: 'fetchInternalUserInfo'}
   | {type: 'fetchDevEnvType'; id: string}
   | {
@@ -1072,6 +1089,7 @@ export type ServerToClientMessage =
   | {type: 'importedStack'; imported: ImportedStack; error: string | undefined}
   | {type: 'fetchedQeFlag'; name: string; passes: boolean}
   | {type: 'fetchedFeatureFlag'; name: string; passes: boolean}
+  | {type: 'bulkFetchedFeatureFlags'; id: string; result: Record<string, boolean>}
   | {type: 'fetchedInternalUserInfo'; info: Serializable}
   | {type: 'fetchedDevEnvType'; envType: string; id: string}
   | {

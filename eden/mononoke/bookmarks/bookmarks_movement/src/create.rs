@@ -250,6 +250,8 @@ impl<'op> CreateBookmarkOp<'op> {
         let info_txn = self
             .run_with_transaction(ctx, authz, repo, hook_manager, None, vec![])
             .await?;
-        info_txn.commit_and_log(ctx, repo).await
+        let log_id = info_txn.commit_and_log(ctx, repo).await?;
+
+        Ok(log_id)
     }
 }

@@ -280,7 +280,11 @@ pub async fn resolve_commit_ids(
                 }
                 CommitId::Bookmark(bookmark) => repo
                     .bookmarks()
-                    .get(ctx.clone(), &BookmarkKey::new(bookmark)?)
+                    .get(
+                        ctx.clone(),
+                        &BookmarkKey::new(bookmark)?,
+                        bookmarks::Freshness::MostRecent,
+                    )
                     .await
                     .and_then(|cs_id| {
                         cs_id.ok_or_else(|| anyhow!("bookmark {} not found", bookmark))

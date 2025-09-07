@@ -30,6 +30,7 @@ use metaconfig_types::GitBundleURIConfig;
 use metaconfig_types::GitConcurrencyParams;
 use metaconfig_types::GitConfigs;
 use metaconfig_types::GitDeltaManifestV2Config;
+use metaconfig_types::GitDeltaManifestV3Config;
 use metaconfig_types::GitDeltaManifestVersion;
 use metaconfig_types::GlobalrevConfig;
 use metaconfig_types::HookBypass;
@@ -91,6 +92,7 @@ use repos::RawGitBundleURIConfig;
 use repos::RawGitConcurrencyParams;
 use repos::RawGitConfigs;
 use repos::RawGitDeltaManifestV2Config;
+use repos::RawGitDeltaManifestV3Config;
 use repos::RawHookConfig;
 use repos::RawHookManagerParams;
 use repos::RawInferredCopyFromConfig;
@@ -519,10 +521,15 @@ impl Convert for RawDerivedDataTypesConfig {
         let git_delta_manifest_version = match self.git_delta_manifest_version {
             None => GitDeltaManifestVersion::default(),
             Some(2) => GitDeltaManifestVersion::V2,
+            Some(3) => GitDeltaManifestVersion::V3,
             Some(version) => return Err(anyhow!("unknown git delta manifest version {}", version)),
         };
         let git_delta_manifest_v2_config = self
             .git_delta_manifest_v2_config
+            .map(|raw| raw.convert())
+            .transpose()?;
+        let git_delta_manifest_v3_config = self
+            .git_delta_manifest_v3_config
             .map(|raw| raw.convert())
             .transpose()?;
 
@@ -548,6 +555,7 @@ impl Convert for RawDerivedDataTypesConfig {
             blame_version,
             git_delta_manifest_version,
             git_delta_manifest_v2_config,
+            git_delta_manifest_v3_config,
             derivation_batch_sizes,
             inferred_copy_from_config,
         })
@@ -572,6 +580,19 @@ impl Convert for RawGitDeltaManifestV2Config {
             max_inlined_object_size: self.max_inlined_object_size as usize,
             max_inlined_delta_size: self.max_inlined_delta_size as u64,
             delta_chunk_size: self.delta_chunk_size as u64,
+        })
+    }
+}
+
+impl Convert for RawGitDeltaManifestV3Config {
+    type Output = GitDeltaManifestV3Config;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(GitDeltaManifestV3Config {
+            max_inlined_object_size: self.max_inlined_object_size as usize,
+            max_inlined_delta_size: self.max_inlined_delta_size as u64,
+            delta_chunk_size: self.delta_chunk_size as u64,
+            entry_chunk_size: self.entry_chunk_size as usize,
         })
     }
 }

@@ -790,13 +790,13 @@ impl<'a> RefValue<'a> {
 }
 
 macro_rules! object {
-    ({ $( $k:ident : $v:expr_2021, )* }) => {{
+    ({ $( $k:ident : $v:expr, )* }) => {{
         #[allow(unused_mut)]
         let mut obj = IndexMap::new();
         $( obj.insert(stringify!($k), object!($v)); )*
         $crate::model::RefValue::Map(obj)
     }};
-    ($v: expr_2021) => { RefValue::from($v) };
+    ($v: expr) => { RefValue::from($v) };
 }
 
 impl TracingData {
@@ -1712,7 +1712,7 @@ impl<'a, S: Eq + Hash> Iterator for TreeWalker<'a, S> {
 
 impl<S: Eq + Hash> TreeSpans<S> {
     /// Walk through the tree.
-    pub fn walk(&self) -> TreeWalker<S> {
+    pub fn walk(&self) -> TreeWalker<'_, S> {
         TreeWalker {
             spans: self,
             stack: vec![(0, 0)],

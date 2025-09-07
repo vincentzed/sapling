@@ -614,7 +614,10 @@ async fn report_bookmark_age_difference(
     bookmark: &BookmarkKey,
 ) -> Result<(), MononokeError> {
     let maybe_bcs_id_from_service = repo.bookmarks_cache().get(ctx, bookmark).await?;
-    let maybe_bcs_id_from_blobrepo = repo.bookmarks().get(ctx.clone(), bookmark).await?;
+    let maybe_bcs_id_from_blobrepo = repo
+        .bookmarks()
+        .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
+        .await?;
 
     if maybe_bcs_id_from_blobrepo.is_none() {
         report_bookmark_missing_from_repo(ctx, repo, bookmark);
@@ -1030,7 +1033,7 @@ impl<R: MononokeRepo> RepoContext<R> {
             cs_id = self
                 .repo()
                 .bookmarks()
-                .get(self.ctx.clone(), bookmark)
+                .get(self.ctx.clone(), bookmark, freshness)
                 .await?
         }
 

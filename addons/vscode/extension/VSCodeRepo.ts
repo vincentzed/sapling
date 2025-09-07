@@ -417,7 +417,7 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
   }
 
   async getCurrentStack(): Promise<ReadonlyArray<SaplingCommitInfo>> {
-    const revset = 'sort(draft() and ancestors(.), -date)';
+    const revset = 'sort(draft() and ancestors(.), topo)';
     const result = await this.runSlCommand([
       'log',
       '--rev',
@@ -427,6 +427,16 @@ export class VSCodeRepo implements vscode.QuickDiffProvider, SaplingRepository {
     ]);
     if (result.exitCode === 0) {
       return parseCommitInfoOutput(this.logger, result.stdout, this.repo.info.codeReviewSystem);
+    } else {
+      throw new Error(result.stderr);
+    }
+  }
+
+  async getDiff(commit?: string): Promise<string> {
+    const result = await this.runSlCommand(['diff', '-c', commit || '.']);
+
+    if (result.exitCode === 0) {
+      return result.stdout;
     } else {
       throw new Error(result.stderr);
     }

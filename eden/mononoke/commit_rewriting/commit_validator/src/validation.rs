@@ -677,7 +677,11 @@ impl ValidationHelpers {
         let maybe_cs_id = self
             .large_repo
             .bookmarks()
-            .get(ctx, &self.large_repo_master_bookmark)
+            .get(
+                ctx,
+                &self.large_repo_master_bookmark,
+                bookmarks::Freshness::MostRecent,
+            )
             .await?;
         maybe_cs_id.ok_or_else(|| format_err!("No master in the large repo"))
     }

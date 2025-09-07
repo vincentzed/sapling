@@ -56,7 +56,7 @@ enum ScubaLoggingType<'a> {
     LocalFile(&'a str),
 }
 
-fn get_scuba_logging_type(arg: &str) -> ScubaLoggingType {
+fn get_scuba_logging_type(arg: &str) -> ScubaLoggingType<'_> {
     if let Some(path) = arg.strip_prefix(FILE_PREFIX) {
         ScubaLoggingType::LocalFile(path)
     } else {
@@ -107,7 +107,7 @@ impl MononokeScubaSampleBuilder {
         })
     }
 
-    fn get_logging_decision_fields(&self) -> ScubaLoggingDecisionFields {
+    fn get_logging_decision_fields(&self) -> ScubaLoggingDecisionFields<'_> {
         ScubaLoggingDecisionFields {
             maybe_session_id: self.get("session_uuid"),
             maybe_unix_username: self.get("unix_username"),
@@ -161,6 +161,38 @@ impl MononokeScubaSampleBuilder {
                 .add("disabled_reads_blobstore_ids", disabled_reads_blobstore_ids);
         }
 
+        let read_bookmarks_from_xdb_replica = justknobs::eval(
+            "scm/mononoke:read_bookmarks_from_xdb_replica",
+            Some(client_info.correlator.as_str()),
+            None,
+        )
+        .unwrap_or(false);
+
+        self.inner.add(
+            "read_bookmarks_from_xdb_replica",
+            read_bookmarks_from_xdb_replica,
+        );
+
+        let use_maybe_stale_freshness_for_bookmarks =
+            ["mononoke_api::repo::git::get_bookmark_state"]
+                .into_iter()
+                .map(|id| id.to_string())
+                .filter(|id| {
+                    justknobs::eval(
+                        "scm/mononoke:use_maybe_stale_freshness_for_bookmarks",
+                        Some(client_info.correlator.as_str()),
+                        Some(id),
+                    )
+                    .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+
+        if !use_maybe_stale_freshness_for_bookmarks.is_empty() {
+            self.inner.add(
+                "use_maybe_stale_freshness_for_bookmarks",
+                use_maybe_stale_freshness_for_bookmarks,
+            );
+        }
         self
     }
 
@@ -444,7 +476,7 @@ impl MononokeScubaSampleBuilder {
         self.inner.log_with_time(time)
     }
 
-    pub fn entry<K: Into<String>>(&mut self, key: K) -> Entry<String, ScubaValue> {
+    pub fn entry<K: Into<String>>(&mut self, key: K) -> Entry<'_, String, ScubaValue> {
         self.inner.entry(key)
     }
 

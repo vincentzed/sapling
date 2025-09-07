@@ -48,11 +48,20 @@ std::optional<ObjectId> VirtualInode::getObjectId() const {
       variant_,
       [](const InodePtr& inode) { return inode->getObjectId(); },
       [](const TreePtr& tree) -> std::optional<ObjectId> {
-        return tree->getHash();
+        return tree->getObjectId();
       },
       [](const auto& entry) -> std::optional<ObjectId> {
         return entry.getObjectId();
       });
+}
+
+bool VirtualInode::isMaterialized() const {
+  return match(
+      variant_,
+      [](const InodePtr& inode) { return inode->isMaterialized(); },
+      [](const TreePtr&) { return false; },
+      [](const UnmaterializedUnloadedBlobDirEntry&) { return false; },
+      [](const TreeEntry&) { return false; });
 }
 
 VirtualInode::ContainedType VirtualInode::testGetContainedType() const {
@@ -107,7 +116,7 @@ ImmediateFuture<Hash32> VirtualInode::getBlake3(
           return ImmediateFuture<Hash32>(hash.value());
         }
         // Revert to querying the objectStore for the file's metadata
-        return objectStore->getBlobBlake3(entry.getHash(), fetchContext);
+        return objectStore->getBlobBlake3(entry.getObjectId(), fetchContext);
       });
 }
 
@@ -148,10 +157,12 @@ ImmediateFuture<std::optional<Hash32>> VirtualInode::getDigestHash(
             entry.getObjectId(), fetchContext);
       },
       [&](const TreePtr& tree) {
-        return objectStore->getTreeDigestHash(tree->getHash(), fetchContext);
+        return objectStore->getTreeDigestHash(
+            tree->getObjectId(), fetchContext);
       },
       [&](const TreeEntry& entry) {
-        return objectStore->getTreeDigestHash(entry.getHash(), fetchContext);
+        return objectStore->getTreeDigestHash(
+            entry.getObjectId(), fetchContext);
       });
 }
 
@@ -196,7 +207,7 @@ ImmediateFuture<Hash20> VirtualInode::getSHA1(
           return ImmediateFuture<Hash20>(hash.value());
         }
         // Revert to querying the objectStore for the file's metadata
-        return objectStore->getBlobSha1(entry.getHash(), fetchContext);
+        return objectStore->getBlobSha1(entry.getObjectId(), fetchContext);
       });
 }
 
@@ -270,7 +281,7 @@ ImmediateFuture<std::optional<TreeAuxData>> VirtualInode::getTreeAuxData(
         return inode.asTreePtr()->getTreeAuxData(fetchContext);
       },
       [&](const TreePtr& tree) {
-        return objectStore->getTreeAuxData(tree->getHash(), fetchContext);
+        return objectStore->getTreeAuxData(tree->getObjectId(), fetchContext);
       },
       [&](auto& entry) {
         return objectStore->getTreeAuxData(entry.getObjectId(), fetchContext);
@@ -281,10 +292,10 @@ namespace {
 bool shouldRequestTreeAuxDataForEntry(
     const std::optional<TreeEntryType>& entryType,
     EntryAttributeFlags entryAttributes,
-    const std::optional<ObjectId>& oid) {
+    const bool isMaterialized) {
   return (entryType.value_or(TreeEntryType::SYMLINK) == TreeEntryType::TREE) &&
       entryAttributes.containsAnyOf(ENTRY_ATTRIBUTES_FROM_TREE_AUX) &&
-      oid.has_value();
+      !isMaterialized;
 }
 
 bool shouldRequestStatForEntry(EntryAttributeFlags entryAttributes) {
@@ -401,9 +412,12 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributesForNonFile(
     attributes.type = folly::Try<std::optional<TreeEntryType>>{entryType};
   }
 
-  auto oid = getObjectId();
+  auto isMat = false;
   if (requestedAttributes.contains(ENTRY_ATTRIBUTE_OBJECT_ID)) {
-    attributes.objectId = folly::Try<std::optional<ObjectId>>{oid};
+    attributes.objectId = folly::Try<std::optional<ObjectId>>{getObjectId()};
+    isMat = !attributes.objectId.value().value().has_value();
+  } else {
+    isMat = isMaterialized();
   }
 
   // Fill in any attributes that may be invalid for NonFile types
@@ -415,41 +429,35 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributesForNonFile(
       entryType,
       additionalErrorContext);
 
-  struct stat empty_stat {};
-  auto statFuture = ImmediateFuture<struct stat>{std::move(empty_stat)};
-  auto shouldRequestStat = shouldRequestStatForEntry(requestedAttributes);
-  if (shouldRequestStat) {
+  auto statFuture = ImmediateFuture<struct stat>::makeEmpty();
+  if (shouldRequestStatForEntry(requestedAttributes)) {
     statFuture = stat(lastCheckoutTime, objectStore, fetchContext);
   }
 
-  auto treeAuxFuture =
-      ImmediateFuture<std::optional<TreeAuxData>>{std::nullopt};
+  auto treeAuxFuture = ImmediateFuture<std::optional<TreeAuxData>>::makeEmpty();
   auto shouldRequestTreeAux =
-      shouldRequestTreeAuxDataForEntry(entryType, requestedAttributes, oid);
+      shouldRequestTreeAuxDataForEntry(entryType, requestedAttributes, isMat);
   // The entry is a tree, and therefore we can attempt to compute tree
   // aux data for it. However, we can only compute the additional attributes
   // of trees that have ObjectIds. In other words, the tree must be
   // unmaterialized.
   if (shouldRequestTreeAux) {
-    treeAuxFuture = objectStore->getTreeAuxData(oid.value(), fetchContext);
+    treeAuxFuture = getTreeAuxData(objectStore, fetchContext);
   } // We return empty tree aux data attributes for materialized directories
-  return collectAll(std::move(statFuture), std::move(treeAuxFuture))
-      .thenValue([entryAttributes = std::move(attributes),
-                  requestedAttributes,
-                  oid,
-                  shouldRequestStat,
-                  shouldRequestTreeAux](const std::tuple<
-                                        folly::Try<struct stat>,
-                                        folly::Try<std::optional<TreeAuxData>>>&
-                                            rawAttributeData) mutable {
+  return collectAllValid(std::move(statFuture), std::move(treeAuxFuture))
+      .thenValue([entryAttributes = std::move(attributes), requestedAttributes](
+                     const std::tuple<
+                         std::optional<folly::Try<struct stat>>,
+                         std::optional<folly::Try<std::optional<TreeAuxData>>>>&
+                         rawAttributeData) mutable {
         auto& [statData, treeAuxTry] = rawAttributeData;
-        if (shouldRequestStat) {
+        if (statData.has_value()) {
           populateStatAttributes(
-              entryAttributes, requestedAttributes, statData);
+              entryAttributes, requestedAttributes, statData.value());
         }
-        if (shouldRequestTreeAux) {
+        if (treeAuxTry.has_value()) {
           populateTreeAuxAttributes(
-              entryAttributes, requestedAttributes, treeAuxTry);
+              entryAttributes, requestedAttributes, treeAuxTry.value());
         }
         return entryAttributes;
       });
@@ -497,6 +505,10 @@ void populateBlobAuxAttributes(
           : std::nullopt;
     }
   }
+}
+
+bool shouldRequestBlobAuxDataForEntry(EntryAttributeFlags entryAttributes) {
+  return entryAttributes.containsAnyOf(ENTRY_ATTRIBUTES_FROM_BLOB_AUX);
 }
 } // namespace
 
@@ -551,16 +563,17 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
   // means there's no need for a Tree case, as Trees are always
   // directories. It's included to check that the visitor here is
   // exhaustive.
-  auto entryTypeFuture = ImmediateFuture<std::optional<TreeEntryType>>{
-      PathError{EINVAL, path, std::string_view{"type not requested"}}};
+  auto entryTypeFuture =
+      ImmediateFuture<std::optional<TreeEntryType>>::makeEmpty();
   if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
     entryTypeFuture =
         getTreeEntryType(path, fetchContext, windowsSymlinksEnabled);
   }
 
-  auto blobAuxdataFuture = ImmediateFuture<BlobAuxData>{PathError{
-      EINVAL, path, std::string_view{"neither sha1 nor size requested"}}};
-  if (requestedAttributes.containsAnyOf(ENTRY_ATTRIBUTES_FROM_BLOB_AUX)) {
+  auto blobAuxdataFuture = ImmediateFuture<BlobAuxData>::makeEmpty();
+  auto shouldRequestBlobAux =
+      shouldRequestBlobAuxDataForEntry(requestedAttributes);
+  if (shouldRequestBlobAux) {
     blobAuxdataFuture = getBlobAuxData(
         path,
         objectStore,
@@ -569,9 +582,9 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
             ENTRY_ATTRIBUTE_BLAKE3 | ENTRY_ATTRIBUTE_DIGEST_HASH));
   }
 
-  auto statFuture = ImmediateFuture<struct stat>{PathError{
-      EINVAL, path, std::string_view{"neither mode nor mtime requested"}}};
-  if (requestedAttributes.containsAnyOf(ENTRY_ATTRIBUTES_FROM_STAT)) {
+  auto statFuture = ImmediateFuture<struct stat>::makeEmpty();
+  auto shouldRequestStat = shouldRequestStatForEntry(requestedAttributes);
+  if (shouldRequestStat) {
     statFuture = stat(lastCheckoutTime, objectStore, fetchContext);
   }
 
@@ -580,7 +593,7 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
     objectId = getObjectId();
   }
 
-  return collectAll(
+  return collectAllValid(
              std::move(entryTypeFuture),
              std::move(blobAuxdataFuture),
              std::move(statFuture))
@@ -589,10 +602,10 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
            entryObjectId = std::move(objectId),
            filePath = RelativePath{path}](
               std::tuple<
-                  folly::Try<std::optional<TreeEntryType>>,
-                  folly::Try<BlobAuxData>,
-                  folly::Try<struct stat>> rawAttributeData) mutable
-          -> EntryAttributes {
+                  std::optional<folly::Try<std::optional<TreeEntryType>>>,
+                  std::optional<folly::Try<BlobAuxData>>,
+                  std::optional<folly::Try<struct stat>>>
+                  rawAttributeData) mutable -> EntryAttributes {
             auto attributes = EntryAttributes{};
             auto& [entryTypeTry, blobAuxTry, statTry] = rawAttributeData;
 
@@ -606,9 +619,15 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
                   folly::Try<std::optional<ObjectId>>{std::move(entryObjectId)};
             }
 
-            populateBlobAuxAttributes(
-                attributes, requestedAttributes, std::move(blobAuxTry));
-            populateStatAttributes(attributes, requestedAttributes, statTry);
+            if (blobAuxTry.has_value()) {
+              populateBlobAuxAttributes(
+                  attributes, requestedAttributes, blobAuxTry.value());
+            }
+
+            if (statTry.has_value()) {
+              populateStatAttributes(
+                  attributes, requestedAttributes, statTry.value());
+            }
 
             return attributes;
           });
@@ -670,7 +689,7 @@ ImmediateFuture<struct stat> VirtualInode::stat(
           st.st_size = 0U;
           return st;
         } else if constexpr (std::is_same_v<T, TreeEntry>) {
-          objectId = arg.getHash();
+          objectId = arg.getObjectId();
           mode = modeFromTreeEntryType(filteredEntryType(
               arg.getType(), objectStore->getWindowsSymlinksEnabled()));
           // fallthrough
@@ -714,7 +733,7 @@ getChildrenHelper(
     if (treeEntry->isTree()) {
       result.emplace_back(
           child.first,
-          objectStore->getTree(treeEntry->getHash(), fetchContext)
+          objectStore->getTree(treeEntry->getObjectId(), fetchContext)
               .thenValue([mode = modeFromTreeEntryType(treeEntry->getType())](
                              TreePtr tree) {
                 return VirtualInode{std::move(tree), mode};
@@ -848,7 +867,7 @@ ImmediateFuture<VirtualInode> getOrFindChildHelper(
   // Always descend if the treeEntry is a Tree
   const auto* treeEntry = &it->second;
   if (treeEntry->isTree()) {
-    return objectStore->getTree(treeEntry->getHash(), fetchContext)
+    return objectStore->getTree(treeEntry->getObjectId(), fetchContext)
         .thenValue(
             [mode = modeFromTreeEntryType(treeEntry->getType())](TreePtr tree) {
               return VirtualInode{std::move(tree), mode};

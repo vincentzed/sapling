@@ -85,12 +85,19 @@ async fn test_simple_unconditional_set_get(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &name_correct).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &name_correct, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(1)))
     );
     assert_eq!(
         bookmarks
-            .get_raw(ctx.clone(), &name_incorrect)
+            .get_raw(
+                ctx.clone(),
+                &name_incorrect,
+                bookmarks::Freshness::MostRecent
+            )
             .await
             .unwrap(),
         None
@@ -136,12 +143,18 @@ async fn test_multi_unconditional_set_get(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(1)))
     );
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_2).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_2, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((TWOS_CSID, Some(2)))
     );
 }
@@ -165,7 +178,10 @@ async fn test_unconditional_set_same_bookmark(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(2)))
     );
 }
@@ -184,7 +200,10 @@ async fn test_simple_create(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(1)))
     );
 
@@ -322,7 +341,10 @@ async fn test_simple_update_bookmark(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((TWOS_CSID, Some(2)))
     );
 
@@ -368,7 +390,10 @@ async fn test_noop_update(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(2)))
     );
 }
@@ -390,7 +415,10 @@ async fn test_scratch_update_bookmark(fb: FacebookInit) {
     assert!(txn.commit().await.unwrap().is_some());
 
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some((TWOS_CSID, None))
     );
 
@@ -455,14 +483,23 @@ async fn test_force_delete(fb: FacebookInit) {
         .unwrap();
     assert!(txn.commit().await.unwrap().is_some());
 
-    assert_eq!(bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(), None);
+    assert_eq!(
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent,)
+            .await
+            .unwrap(),
+        None
+    );
 
     let mut txn = bookmarks.create_transaction(ctx.clone());
     txn.create(&key_1, ONES_CSID, BookmarkUpdateReason::TestMove)
         .unwrap();
     assert!(txn.commit().await.unwrap().is_some());
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent,)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(2)))
     );
 
@@ -471,7 +508,13 @@ async fn test_force_delete(fb: FacebookInit) {
         .unwrap();
     assert!(txn.commit().await.unwrap().is_some());
 
-    assert_eq!(bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(), None);
+    assert_eq!(
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent,)
+            .await
+            .unwrap(),
+        None
+    );
 
     compare_log_entries(
         bookmarks
@@ -514,7 +557,10 @@ async fn test_delete(fb: FacebookInit) {
         .unwrap();
     assert!(txn.commit().await.unwrap().is_some());
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent,)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(1)))
     );
 
@@ -559,7 +605,10 @@ async fn test_delete_incorrect_hash(fb: FacebookInit) {
         .unwrap();
     assert!(txn.commit().await.unwrap().is_some());
     assert_eq!(
-        bookmarks.get_raw(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks
+            .get_raw(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent,)
+            .await
+            .unwrap(),
         Some((ONES_CSID, Some(1)))
     );
 
@@ -676,11 +725,18 @@ async fn test_create_different_repos(fb: FacebookInit) {
     assert!(txn.commit().await.is_ok());
 
     assert_eq!(
-        bookmarks_0.get(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks_0
+            .get(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some(ONES_CSID)
     );
+
     assert_eq!(
-        bookmarks_1.get(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks_1
+            .get(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some(TWOS_CSID)
     );
 
@@ -689,8 +745,12 @@ async fn test_create_different_repos(fb: FacebookInit) {
     txn.force_delete(&key_1, BookmarkUpdateReason::TestMove)
         .unwrap();
     assert!(txn.commit().await.is_ok());
+
     assert_eq!(
-        bookmarks_0.get(ctx.clone(), &key_1).await.unwrap(),
+        bookmarks_0
+            .get(ctx.clone(), &key_1, bookmarks::Freshness::MostRecent)
+            .await
+            .unwrap(),
         Some(ONES_CSID)
     );
 

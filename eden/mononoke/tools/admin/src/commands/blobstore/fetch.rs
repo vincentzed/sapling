@@ -23,7 +23,9 @@ use cmdlib_displaying::hexdump;
 use context::CoreContext;
 use futures::TryStreamExt;
 use git_types::GDMV2Entry;
+use git_types::GDMV3Chunk;
 use git_types::GitDeltaManifestV2;
+use git_types::GitDeltaManifestV3;
 use mercurial_types::HgAugmentedManifestEntry;
 use mercurial_types::HgAugmentedManifestEnvelope;
 use mercurial_types::HgChangesetEnvelope;
@@ -46,6 +48,8 @@ use mononoke_types::content_manifest::ContentManifestEntry;
 use mononoke_types::deleted_manifest_v2::DeletedManifestV2;
 use mononoke_types::fastlog_batch::FastlogBatch;
 use mononoke_types::fsnode::Fsnode;
+use mononoke_types::inferred_copy_from::InferredCopyFrom;
+use mononoke_types::inferred_copy_from::InferredCopyFromEntry;
 use mononoke_types::sharded_map::ShardedMapNode;
 use mononoke_types::sharded_map_v2::ShardedMapV2Node;
 use mononoke_types::skeleton_manifest::SkeletonManifest;
@@ -95,6 +99,8 @@ pub enum DecodeAs {
     ShardedHgAugmentedManifest,
     GitDeltaManifestV2MapNode,
     GitDeltaManifestV2,
+    GitDeltaManifestV3Chunk,
+    GitDeltaManifestV3,
     SkeletonManifest,
     SkeletonManifestV2MapNode,
     SkeletonManifestV2,
@@ -117,6 +123,8 @@ pub enum DecodeAs {
     TestShardedManifestMapNode,
     ContentManifest,
     ContentManifestMapNode,
+    InferredCopyFrom,
+    InferredCopyFromMapNode,
 }
 
 impl DecodeAs {
@@ -139,6 +147,8 @@ impl DecodeAs {
                 ("hgaugmentedmanifest.", DecodeAs::HgAugmentedManifest),
                 ("gdm2.map2node.", DecodeAs::GitDeltaManifestV2MapNode),
                 ("gdm2.", DecodeAs::GitDeltaManifestV2),
+                ("gdm3_chunk.", DecodeAs::GitDeltaManifestV3Chunk),
+                ("gdm3.", DecodeAs::GitDeltaManifestV3),
                 ("skeletonmanifest.", DecodeAs::SkeletonManifest),
                 ("skmf2.map2node.", DecodeAs::SkeletonManifestV2MapNode),
                 ("skmf2.", DecodeAs::SkeletonManifestV2),
@@ -173,6 +183,8 @@ impl DecodeAs {
                 ("changeset_info.", DecodeAs::ChangesetInfo),
                 ("contentmf.map2node.", DecodeAs::ContentManifestMapNode),
                 ("contentmf.", DecodeAs::ContentManifest),
+                ("icf.map2node.", DecodeAs::InferredCopyFromMapNode),
+                ("icf.", DecodeAs::InferredCopyFrom),
             ] {
                 if key[index..].starts_with(prefix) {
                     return Some(auto_decode_as);
@@ -262,6 +274,12 @@ async fn decode(
         DecodeAs::GitDeltaManifestV2MapNode => Decoded::try_debug(
             ShardedMapV2Node::<GDMV2Entry>::from_bytes(&data.into_raw_bytes()),
         ),
+        DecodeAs::GitDeltaManifestV3 => {
+            Decoded::try_debug(GitDeltaManifestV3::from_bytes(&data.into_raw_bytes()))
+        }
+        DecodeAs::GitDeltaManifestV3Chunk => {
+            Decoded::try_debug(GDMV3Chunk::from_bytes(&data.into_raw_bytes()))
+        }
         DecodeAs::SkeletonManifestV2 => {
             Decoded::try_debug(SkeletonManifestV2::from_bytes(&data.into_raw_bytes()))
         }
@@ -331,6 +349,14 @@ async fn decode(
         }
         DecodeAs::ContentManifestMapNode => {
             Decoded::try_debug(ShardedMapV2Node::<ContentManifestEntry>::from_bytes(
+                &data.into_raw_bytes(),
+            ))
+        }
+        DecodeAs::InferredCopyFrom => {
+            Decoded::try_debug(InferredCopyFrom::from_bytes(&data.into_raw_bytes()))
+        }
+        DecodeAs::InferredCopyFromMapNode => {
+            Decoded::try_debug(ShardedMapV2Node::<InferredCopyFromEntry>::from_bytes(
                 &data.into_raw_bytes(),
             ))
         }

@@ -31,7 +31,7 @@ namespace facebook::eden {
  * For non-recursive globs this allows an efficient walk and compare
  * as we work through the tree.  Path components that have no glob
  * special characters can be looked up directly from the directory
- * contents as a hash lookup, rather than by repeatedly matching the
+ * contents as an id lookup, rather than by repeatedly matching the
  * pattern against each entry.
  */
 class GlobNodeImpl {
@@ -156,7 +156,7 @@ class GlobNodeImpl {
             if (fileBlobsToPrefetch &&
                 root.entryShouldPrefetch(&entry.second)) {
               fileBlobsToPrefetch->wlock()->emplace_back(
-                  entry.second.getHash());
+                  entry.second.getObjectId());
             }
             // No sense running multiple matches for this same file.
             break;
@@ -170,7 +170,7 @@ class GlobNodeImpl {
             subDirNames.emplace_back(std::move(candidateName));
           } else {
             futures.emplace_back(
-                store->getTree(entry.second.getHash(), context)
+                store->getTree(entry.second.getObjectId(), context)
                     .thenValue(
                         [candidateName = std::move(candidateName),
                          rootPath = rootPath.copy(),
@@ -273,7 +273,7 @@ class GlobNodeImpl {
           recurse.emplace_back(name, node);
         } else {
           futures.emplace_back(
-              store->getTree(entry->getHash(), context)
+              store->getTree(entry->getObjectId(), context)
                   .thenValue(
                       [candidateName = rootPath + name,
                        store,
@@ -315,7 +315,7 @@ class GlobNodeImpl {
               if (fileBlobsToPrefetch &&
                   root.entryShouldPrefetch(&entry->second)) {
                 fileBlobsToPrefetch->wlock()->emplace_back(
-                    entry->second.getHash());
+                    entry->second.getObjectId());
               }
             }
 
@@ -333,7 +333,7 @@ class GlobNodeImpl {
                 if (fileBlobsToPrefetch &&
                     root.entryShouldPrefetch(&entry.second)) {
                   fileBlobsToPrefetch->wlock()->emplace_back(
-                      entry.second.getHash());
+                      entry.second.getObjectId());
                 }
               }
               // Not the leaf of a pattern; if this is a dir, we need to

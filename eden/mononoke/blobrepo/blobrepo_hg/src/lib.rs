@@ -349,7 +349,10 @@ impl<T: CommitGraphRef + BonsaiHgMappingRef + Send + Sync> BlobRepoHg for T {
         Self: BookmarksRef + RepoDerivedDataRef,
     {
         STATS::get_bookmark_hg.add_value(1);
-        let cs_opt = self.bookmarks().get(ctx.clone(), name).await?;
+        let cs_opt = self
+            .bookmarks()
+            .get(ctx.clone(), name, bookmarks::Freshness::MostRecent)
+            .await?;
         match cs_opt {
             None => Ok(None),
             Some(cs) => {

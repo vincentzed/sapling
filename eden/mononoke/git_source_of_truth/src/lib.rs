@@ -35,12 +35,25 @@ pub enum Staleness {
 #[facet::facet]
 #[async_trait]
 pub trait GitSourceOfTruthConfig: Send + Sync {
-    async fn set(
+    async fn insert_or_update_repo(
         &self,
         ctx: &CoreContext,
         repo_id: RepositoryId,
         repo_name: RepositoryName,
         source_of_truth: GitSourceOfTruth,
+    ) -> Result<()>;
+
+    async fn insert_repos(
+        &self,
+        _ctx: &CoreContext,
+        _repos: &[(RepositoryId, RepositoryName, GitSourceOfTruth)],
+    ) -> Result<()>;
+
+    async fn update_source_of_truth_by_repo_names(
+        &self,
+        ctx: &CoreContext,
+        source_of_truth: GitSourceOfTruth,
+        repo_names: &[RepositoryName],
     ) -> Result<()>;
 
     async fn get_max_id(&self, ctx: &CoreContext) -> Result<Option<RepositoryId>>;
@@ -63,6 +76,8 @@ pub trait GitSourceOfTruthConfig: Send + Sync {
     ) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
 
     async fn get_locked(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
+
+    async fn get_reserved(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>>;
 }
 
 #[derive(Clone)]
@@ -70,12 +85,29 @@ pub struct NoopGitSourceOfTruthConfig {}
 
 #[async_trait]
 impl GitSourceOfTruthConfig for NoopGitSourceOfTruthConfig {
-    async fn set(
+    async fn insert_or_update_repo(
         &self,
         _ctx: &CoreContext,
         _repo_id: RepositoryId,
         _repo_name: RepositoryName,
         _source_of_truth: GitSourceOfTruth,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn insert_repos(
+        &self,
+        _ctx: &CoreContext,
+        _repos: &[(RepositoryId, RepositoryName, GitSourceOfTruth)],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    async fn update_source_of_truth_by_repo_names(
+        &self,
+        _ctx: &CoreContext,
+        _source_of_truth: GitSourceOfTruth,
+        _repo_names: &[RepositoryName],
     ) -> Result<()> {
         Ok(())
     }
@@ -110,6 +142,10 @@ impl GitSourceOfTruthConfig for NoopGitSourceOfTruthConfig {
     async fn get_locked(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
         Ok(vec![])
     }
+
+    async fn get_reserved(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
+        Ok(vec![])
+    }
 }
 
 #[derive(Clone)]
@@ -127,7 +163,7 @@ impl TestGitSourceOfTruthConfig {
 
 #[async_trait]
 impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
-    async fn set(
+    async fn insert_or_update_repo(
         &self,
         _ctx: &CoreContext,
         repo_id: RepositoryId,
@@ -144,6 +180,50 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
                 source_of_truth,
             },
         );
+        Ok(())
+    }
+
+    async fn insert_repos(
+        &self,
+        _ctx: &CoreContext,
+        repos: &[(RepositoryId, RepositoryName, GitSourceOfTruth)],
+    ) -> Result<()> {
+        let mut map = self.entries.lock().expect("poisoned lock");
+        if map.values().any(|config_entry| {
+            for (repo_id, repo_name, _) in repos {
+                if repo_id == &config_entry.repo_id || repo_name == &config_entry.repo_name {
+                    return true;
+                }
+            }
+            false
+        }) {
+            anyhow::bail!("Attempting to insert duplicate entry");
+        }
+        for (repo_id, repo_name, source_of_truth) in repos {
+            map.insert(
+                repo_name.to_owned(),
+                GitSourceOfTruthConfigEntry {
+                    id: RowId(0),
+                    repo_id: *repo_id,
+                    repo_name: repo_name.clone(),
+                    source_of_truth: *source_of_truth,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    async fn update_source_of_truth_by_repo_names(
+        &self,
+        _ctx: &CoreContext,
+        source_of_truth: GitSourceOfTruth,
+        repo_names: &[RepositoryName],
+    ) -> Result<()> {
+        let mut map = self.entries.lock().expect("poisoned lock");
+        for repo_name in repo_names {
+            map.entry(repo_name.clone())
+                .and_modify(|entry| entry.source_of_truth = source_of_truth);
+        }
         Ok(())
     }
 
@@ -206,6 +286,17 @@ impl GitSourceOfTruthConfig for TestGitSourceOfTruthConfig {
             .expect("poisoned lock")
             .values()
             .filter(|entry| entry.source_of_truth == GitSourceOfTruth::Locked)
+            .cloned()
+            .collect())
+    }
+
+    async fn get_reserved(&self, _ctx: &CoreContext) -> Result<Vec<GitSourceOfTruthConfigEntry>> {
+        Ok(self
+            .entries
+            .lock()
+            .expect("poisoned lock")
+            .values()
+            .filter(|entry| entry.source_of_truth == GitSourceOfTruth::Reserved)
             .cloned()
             .collect())
     }

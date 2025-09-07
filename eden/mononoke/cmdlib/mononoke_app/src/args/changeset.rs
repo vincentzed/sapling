@@ -91,7 +91,7 @@ impl ChangesetArgs {
         stream::iter(self.bookmark.iter())
             .then(|bookmark| async move {
                 repo.bookmarks()
-                    .get(ctx.clone(), bookmark)
+                    .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
                     .await
                     .with_context(|| format!("Failed to resolve bookmark '{}'", bookmark))?
                     .ok_or_else(|| anyhow!("Couldn't find bookmark: {}", bookmark))

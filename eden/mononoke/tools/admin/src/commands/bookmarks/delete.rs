@@ -65,7 +65,11 @@ pub async fn delete(
         parse_commit_id(ctx, repo, old_commit_id).await?
     } else {
         repo.bookmarks()
-            .get(ctx.clone(), &delete_args.name)
+            .get(
+                ctx.clone(),
+                &delete_args.name,
+                bookmarks::Freshness::MostRecent,
+            )
             .await
             .with_context(|| format!("Failed to resolve bookmark '{}'", delete_args.name))?
             .ok_or_else(|| {

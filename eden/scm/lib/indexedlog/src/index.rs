@@ -2011,6 +2011,10 @@ pub struct Index {
     // Additional buffer for external keys.
     // Log::sync needs write access to this field.
     pub(crate) key_buf: Arc<dyn ReadonlyBuffer + Send + Sync>,
+
+    // Emulate errors during flush.
+    #[cfg(test)]
+    fail_on_flush: u16,
 }
 
 /// Abstraction of the "external key buffer".
@@ -2247,6 +2251,8 @@ impl OpenOptions {
                 dirty_keys: vec![],
                 dirty_ext_keys: vec![],
                 key_buf: key_buf.unwrap_or_else(|| Arc::new(&b""[..])),
+                #[cfg(test)]
+                fail_on_flush: 0,
             };
 
             Ok(index)
@@ -2287,6 +2293,8 @@ impl OpenOptions {
                 dirty_keys: vec![],
                 dirty_ext_keys: vec![],
                 key_buf: key_buf.unwrap_or_else(|| Arc::new(&b""[..])),
+                #[cfg(test)]
+                fail_on_flush: 0,
             })
         })();
         result.context("in index::OpenOptions::create_in_memory")
@@ -2483,6 +2491,8 @@ impl Index {
                 dirty_links: self.dirty_links.clone(),
                 dirty_radixes: self.dirty_radixes.clone(),
                 key_buf: self.key_buf.clone(),
+                #[cfg(test)]
+                fail_on_flush: self.fail_on_flush,
             }
         } else {
             Index {
@@ -2507,6 +2517,8 @@ impl Index {
                     Vec::new()
                 },
                 key_buf: self.key_buf.clone(),
+                #[cfg(test)]
+                fail_on_flush: self.fail_on_flush,
             }
         };
 
@@ -2580,6 +2592,8 @@ impl Index {
     ///
     /// For in-memory-only indexes, this function does nothing and returns 0,
     /// unless read-only was set at open time.
+    ///
+    /// If `flush` fails, the index could still be queried and flush again.
     pub fn flush(&mut self) -> crate::Result<u64> {
         let result: crate::Result<_> = (|| {
             let span = debug_span!("Index::flush", path = self.path.to_string_lossy().as_ref());
@@ -2623,6 +2637,8 @@ impl Index {
                     .as_mut()
                     .seek(SeekFrom::End(0))
                     .context(&path, "cannot seek to end")?;
+
+                test_only_fail_point!(self.fail_on_flush == 1);
                 if len < old_len {
                     let message = format!(
                         "on-disk index is unexpectedly smaller ({} bytes) than its previous version ({} bytes)",
@@ -2715,6 +2731,8 @@ impl Index {
 
                 // Update and write Checksum if it's enabled.
                 let mut new_checksum = self.checksum.clone();
+
+                test_only_fail_point!(self.fail_on_flush == 2);
                 let checksum_len = if self.checksum_enabled {
                     new_checksum
                         .update(&self.buf, lock.as_mut(), len, &buf)
@@ -2733,44 +2751,55 @@ impl Index {
                 write_reversed_vlq(&mut buf, root_len + checksum_len).infallible()?;
 
                 new_len = buf.len() as u64 + len;
+
+                test_only_fail_point!(self.fail_on_flush == 3);
                 lock.as_mut()
                     .seek(SeekFrom::Start(len))
                     .context(&path, "cannot seek")?;
+
+                test_only_fail_point!(self.fail_on_flush == 4);
                 lock.as_mut()
                     .write_all(&buf)
                     .context(&path, "cannot write new data to index")?;
 
+                test_only_fail_point!(self.fail_on_flush == 5);
                 if self.fsync || config::get_global_fsync() {
                     lock.as_mut().sync_all().context(&path, "cannot sync")?;
                 }
 
                 // Remap and update root since length has changed
+                test_only_fail_point!(self.fail_on_flush == 6);
                 let bytes = mmap_bytes(lock.as_ref(), None).context(&path, "cannot mmap")?;
-                self.buf = bytes;
 
                 // 'path' should not have changed.
                 debug_assert_eq!(&self.path, &path);
 
                 // This is to workaround the borrow checker.
-                let this = SimpleIndexBuf(&self.buf, &path);
+                let this = SimpleIndexBuf(&bytes, &path);
 
                 // Sanity check - the length should be expected. Otherwise, the lock
                 // is somehow ineffective.
-                if self.buf.len() as u64 != new_len {
+                test_only_fail_point!(self.fail_on_flush == 7);
+                if bytes.len() as u64 != new_len {
                     return Err(this.corruption("file changed unexpectedly"));
                 }
 
                 // Reload root and checksum.
-                let (root, checksum) =
-                    read_root_checksum_at_end(&path, &self.buf, new_len as usize)?;
+                test_only_fail_point!(self.fail_on_flush == 8);
+                let (root, checksum) = read_root_checksum_at_end(&path, &bytes, new_len as usize)?;
 
+                // Only mutate `self` when everything is ready, without possible IO errors
+                // in remaining operations. This avoids "partial updated, inconsistent"
+                // `self` state.
                 debug_assert_eq!(checksum.end, new_checksum.end);
                 debug_assert_eq!(&checksum.xxhash_list, &new_checksum.xxhash_list);
                 self.checksum = checksum;
                 self.clean_root = root;
+                self.buf = bytes;
             }
 
             // Outside critical section
+            // Drop the in-memory state only after a successful file write.
             self.clear_dirty();
 
             if cfg!(all(debug_assertions, test)) {
@@ -2836,7 +2865,7 @@ impl Index {
     pub fn scan_prefix_base16(
         &self,
         mut base16: impl Iterator<Item = u8>,
-    ) -> crate::Result<RangeIter> {
+    ) -> crate::Result<RangeIter<'_>> {
         let mut offset: Offset = self.dirty_root.radix_offset.into();
         let mut front_stack = Vec::<IterState>::new();
 
@@ -2892,7 +2921,7 @@ impl Index {
 
     /// Scan entries which match the given prefix in base256 form.
     /// Return [`RangeIter`] which allows accesses to keys and values.
-    pub fn scan_prefix<B: AsRef<[u8]>>(&self, prefix: B) -> crate::Result<RangeIter> {
+    pub fn scan_prefix<B: AsRef<[u8]>>(&self, prefix: B) -> crate::Result<RangeIter<'_>> {
         self.scan_prefix_base16(Base16Iter::from_base256(&prefix))
             .context(|| format!("in Index::scan_prefix({:?})", prefix.as_ref()))
             .context(|| format!("  Index.path = {:?}", self.path))
@@ -2900,7 +2929,7 @@ impl Index {
 
     /// Scan entries which match the given prefix in hex form.
     /// Return [`RangeIter`] which allows accesses to keys and values.
-    pub fn scan_prefix_hex<B: AsRef<[u8]>>(&self, prefix: B) -> crate::Result<RangeIter> {
+    pub fn scan_prefix_hex<B: AsRef<[u8]>>(&self, prefix: B) -> crate::Result<RangeIter<'_>> {
         // Invalid hex chars will be caught by `radix.child`
         let base16 = prefix.as_ref().iter().cloned().map(single_hex_to_base16);
         self.scan_prefix_base16(base16)
@@ -2912,7 +2941,7 @@ impl Index {
     ///
     /// Returns a double-ended iterator, which provides accesses to keys and
     /// values.
-    pub fn range<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> crate::Result<RangeIter> {
+    pub fn range<'a>(&self, range: impl RangeBounds<&'a [u8]>) -> crate::Result<RangeIter<'_>> {
         let is_empty_range = match (range.start_bound(), range.end_bound()) {
             (Included(start), Included(end)) => start > end,
             (Included(start), Excluded(end)) => start > end,
@@ -4756,6 +4785,41 @@ Disk[410]: Root { radix: Disk[402] }
         assert_eq!(len1, len2);
     }
 
+    #[test]
+    fn test_flush_with_replaced_file() {
+        let dir = tempdir().unwrap();
+        let path1 = dir.path().join("1");
+        let path2 = dir.path().join("2");
+        let mut index1 = open_opts().open(&path1).unwrap();
+        let mut index2 = open_opts().open(&path2).unwrap();
+
+        index1.insert(b"foo1", 1).unwrap();
+        index1.insert(b"z1", 1).unwrap();
+        index2.insert(b"foo1", 2).unwrap();
+        index2.insert(b"z1", 2).unwrap();
+
+        let len1 = index1.flush().unwrap();
+        let len2 = index2.flush().unwrap();
+
+        assert_eq!(len1, len2);
+
+        // Modify index1 so it has pending in-memory changes.
+        index1.insert(b"z1", 3).unwrap();
+
+        // Attempt to modify index1 by replacing its underlying file. This won't actaully break
+        // index1, because Index operates at the file descriptor level, not the path level (unlike
+        // Log), Index will not reload the file from the same path on flush.
+        fs::rename(&path1, &path1.with_extension("bak")).unwrap();
+        fs::rename(&path2, &path1).unwrap();
+
+        // "index1.flush" failure shouldn't change its internal state.
+        index1.fail_on_flush = 8;
+        index1.flush().unwrap_err();
+        let link_offset = index1.get(b"foo1").expect("lookup");
+        // "foo1" in index1 should still be "1", not "2" in index2.
+        assert_eq!(link_offset.value_and_next(&index1).unwrap().0, 1);
+    }
+
     quickcheck! {
         fn test_single_value(map: HashMap<Vec<u8>, u64>, flush: bool) -> bool {
             let dir = tempdir().unwrap();
@@ -4770,10 +4834,48 @@ Disk[410]: Root { radix: Disk[402] }
                 index = open_opts().logical_len(len.into()).open(dir.path().join("a")).unwrap();
             }
 
-            map.iter().all(|(key, value)| {
-                let link_offset = index.get(key).expect("lookup");
-                assert!(!link_offset.is_null());
-                link_offset.value_and_next(&index).unwrap().0 == *value
+            index.verify_against_hashmap(&map)
+        }
+
+        fn test_flush_failure(map: HashMap<Vec<u8>, u64>) -> bool {
+            let dir = tempdir().unwrap();
+            let mut index = open_opts().open(dir.path().join("a")).expect("open");
+
+            // Populate `index` - some entries on disk, some in memory.
+            for (key, value) in &map {
+                if value % 2 == 0 {
+                    index.insert(key, *value).expect("insert");
+                }
+            }
+            index.flush().expect("flush");
+
+            // flush should only fail if it is not a no-op - has pending entries in memory.
+            let mut should_fail = false;
+            for (key, value) in &map {
+                if value % 2 == 1 {
+                    index.insert(key, *value).expect("insert");
+                    should_fail = true;
+                }
+            }
+
+            (1..=8).all(|flush_failure| {
+                let mut index = index.try_clone().expect("clone");
+                index.fail_on_flush = flush_failure;
+                let old_index_buf_len = index.buf.len();
+                assert_eq!(index.flush().is_err(), should_fail);
+                assert_eq!(old_index_buf_len, index.buf.len());
+
+                // Verify entries in map.
+                let mut verified = index.verify_against_hashmap(&map);
+
+                // Try flush again - should succeed.
+                if !should_fail {
+                    index.fail_on_flush = 0;
+                    index.flush().expect("flush should succeed");
+                    verified &= index.verify_against_hashmap(&map)
+                }
+
+                verified
             })
         }
 
@@ -4860,6 +4962,17 @@ Disk[410]: Root { radix: Disk[402] }
                     .map(|s| s.unwrap().0.as_ref().to_vec())
                     .collect::<Vec<_>>()
                     == set.iter().cloned().collect::<Vec<_>>()
+            })
+        }
+    }
+
+    impl Index {
+        fn verify_against_hashmap(&self, map: &HashMap<Vec<u8>, u64>) -> bool {
+            let index = self;
+            map.iter().all(|(key, value)| {
+                let link_offset = index.get(key).expect("lookup");
+                assert!(!link_offset.is_null());
+                link_offset.value_and_next(&index).unwrap().0 == *value
             })
         }
     }

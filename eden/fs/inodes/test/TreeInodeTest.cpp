@@ -37,14 +37,14 @@ namespace {
 constexpr auto kFutureTimeout = 10s;
 constexpr auto materializationTimeoutLimit = 1000ms;
 
-std::string testHashHex{
+std::string testIdHex{
     "faceb00c"
     "deadbeef"
     "c00010ff"
     "1badb002"
     "8badf00d"};
 
-ObjectId testHash(testHashHex);
+ObjectId testId(testIdHex);
 
 DirEntry makeDirEntry() {
   return DirEntry{S_IFREG | 0644, 1_ino, ObjectId{}};
@@ -63,7 +63,7 @@ TEST(TreeInode, findEntryDifferencesWithSameEntriesReturnsNone) {
   Tree tree{
       {{makeTreeEntry("one"), makeTreeEntry("two")},
        CaseSensitivity::Sensitive},
-      testHash};
+      testId};
 
   EXPECT_FALSE(findEntryDifferences(dir, tree));
 }
@@ -75,7 +75,7 @@ TEST(TreeInode, findEntryDifferencesReturnsAdditionsAndSubtractions) {
   Tree tree{
       {{makeTreeEntry("one"), makeTreeEntry("three")},
        CaseSensitivity::Sensitive},
-      testHash};
+      testId};
 
   auto differences = findEntryDifferences(dir, tree);
   EXPECT_TRUE(differences);
@@ -86,7 +86,7 @@ TEST(TreeInode, findEntryDifferencesWithOneSubtraction) {
   DirContents dir(CaseSensitivity::Sensitive);
   dir.emplace("one"_pc, makeDirEntry());
   dir.emplace("two"_pc, makeDirEntry());
-  Tree tree{{{makeTreeEntry("one")}, CaseSensitivity::Sensitive}, testHash};
+  Tree tree{{{makeTreeEntry("one")}, CaseSensitivity::Sensitive}, testId};
 
   auto differences = findEntryDifferences(dir, tree);
   EXPECT_TRUE(differences);
@@ -100,7 +100,7 @@ TEST(TreeInode, findEntryDifferencesWithOneAddition) {
   Tree tree{
       {{makeTreeEntry("one"), makeTreeEntry("two"), makeTreeEntry("three")},
        CaseSensitivity::Sensitive},
-      testHash};
+      testId};
 
   auto differences = findEntryDifferences(dir, tree);
   EXPECT_TRUE(differences);
@@ -490,10 +490,10 @@ TEST(TreeInode, setattr) {
   TestMount mount{builder};
   auto somedir = mount.getTreeInode("somedir"_relpath);
 
-  EXPECT_FALSE(somedir->getContents().rlock()->isMaterialized());
+  EXPECT_FALSE(somedir->isMaterialized());
   DesiredMetadata emptyMetadata{};
   somedir->setattr(emptyMetadata, ObjectFetchContext::getNullContext());
-  EXPECT_FALSE(somedir->getContents().rlock()->isMaterialized());
+  EXPECT_FALSE(somedir->isMaterialized());
 
   auto oldauxData = somedir->getMetadata();
   DesiredMetadata sameMetadata{
@@ -504,7 +504,7 @@ TEST(TreeInode, setattr) {
       oldauxData.timestamps.atime.toTimespec(),
       oldauxData.timestamps.mtime.toTimespec()};
   somedir->setattr(sameMetadata, ObjectFetchContext::getNullContext());
-  EXPECT_FALSE(somedir->getContents().rlock()->isMaterialized());
+  EXPECT_FALSE(somedir->isMaterialized());
 
   DesiredMetadata newMetadata{
       std::nullopt,
@@ -514,7 +514,7 @@ TEST(TreeInode, setattr) {
       oldauxData.timestamps.atime.toTimespec(),
       oldauxData.timestamps.mtime.toTimespec()};
   somedir->setattr(newMetadata, ObjectFetchContext::getNullContext());
-  EXPECT_TRUE(somedir->getContents().rlock()->isMaterialized());
+  EXPECT_TRUE(somedir->isMaterialized());
 }
 
 TEST(TreeInode, addNewMaterializationsToInodeTraceBus) {
@@ -648,6 +648,7 @@ TEST(TreeInode, getOrFindChildrenMaterializedLoadedChild) {
   TestMount mount{builder};
   auto somedir = mount.getTreeInode("somedir"_relpath);
   somedir->mknod("newfile.txt"_pc, S_IFREG | 0740, 0, InvalidationRequired::No);
+  EXPECT_TRUE(somedir->isMaterialized());
 
   auto result =
       somedir->getChildren(ObjectFetchContext::getNullContext(), false);

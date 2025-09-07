@@ -195,7 +195,11 @@ async fn find_unmerged_commits(
     // let bookmark_value = helpers::csid_resolve(ctx, repo, bookmark_to_merge_into).await?;
     let bookmark_value = repo
         .bookmarks()
-        .get(ctx.clone(), bookmark_to_merge_into)
+        .get(
+            ctx.clone(),
+            bookmark_to_merge_into,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| anyhow::anyhow!("Bookmark {bookmark_to_merge_into} doesn't exist"))?;
 

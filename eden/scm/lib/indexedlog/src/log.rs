@@ -43,6 +43,7 @@ use std::io;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::ops::Range;
 use std::ops::RangeBounds;
 use std::path::Path;
 use std::pin::Pin;
@@ -59,6 +60,7 @@ use tracing::trace;
 use vlqencoding::VLQDecodeAt;
 use vlqencoding::VLQEncode;
 
+use crate::btrfs;
 use crate::change_detect::SharedChangeDetector;
 use crate::config;
 use crate::errors::IoResultExt;
@@ -73,6 +75,7 @@ use crate::index::ReadonlyBuffer;
 use crate::lock::READER_LOCK_OPTS;
 use crate::lock::ScopedDirLock;
 use crate::utils;
+use crate::utils::mmap_bytes;
 use crate::utils::mmap_path;
 use crate::utils::xxhash;
 use crate::utils::xxhash32;
@@ -144,16 +147,29 @@ pub struct Log {
     // all_folds includes both clean (on-disk) and dirty (in-memory) entries.
     disk_folds: Vec<FoldState>,
     all_folds: Vec<FoldState>,
-    // Whether the index and the log is out-of-sync. In which case, index-based reads (lookups)
-    // should return errors because it can no longer be trusted.
-    // This could be improved to be per index. For now, it's a single state for simplicity. It's
-    // probably fine considering index corruptions are rare.
-    index_corrupted: bool,
+    // Whether the index and the log is potentially out-of-sync.
+    // For example:
+    // - update_indexes_for_on_disk_entries_unchecked failure.
+    //   On-disk indexes are intentionally lagging behind the on-disk primary
+    //   logs to reduce disk space usage.
+    //   When opening a log, we try to make the index "catch up" (in memory)
+    //   with the log. If this fails, the index is incomplete and cannot query
+    //   the lagged portion of the log.
+    // - update_indexes_for_in_memory_entry failure.
+    //   When appending an entry to the (in-memory portion of) log, we need to
+    //   update the indexes. If this fails, the index will not cover the appended
+    //   entry.
+    // If this is set, then index-based reads (lookups) should return errors because it can no
+    // longer be trusted.
+    // This could be improved to be per index. For now, it's a single state for simplicity.
+    index_out_of_sync: Option<String>,
     open_options: OpenOptions,
     // Indicate an active reader. Destrictive writes (repair) are unsafe.
     reader_lock: Option<ScopedDirLock>,
     // Cross-process cheap change detector backed by mmap.
     change_detector: Option<SharedChangeDetector>,
+    // Btrfs metadata from last time we checked log's physical size. Used to make subsequent checks faster.
+    prev_btrfs_metadata: Option<btrfs::Metadata>,
 }
 
 /// Iterator over all entries in a [`Log`].
@@ -256,8 +272,68 @@ impl Log {
     ///
     /// To write in-memory entries and indexes to disk, call [`Log::sync`].
     pub fn append<T: AsRef<[u8]>>(&mut self, data: T) -> crate::Result<()> {
-        let result: crate::Result<_> = (|| {
+        self.append_internal::<crate::Error>(
+            |buf| {
+                buf.extend_from_slice(data.as_ref());
+                Ok::<_, crate::Error>(())
+            },
+            Some(data.as_ref().len()),
+        )
+        .context(|| {
             let data = data.as_ref();
+            if data.len() < 128 {
+                format!("in Log::append({:?})", data)
+            } else {
+                format!("in Log::append(<a {}-byte long slice>)", data.len())
+            }
+        })
+    }
+
+    /// Similar to [`Log::append`], but data is written via a callback. This allows the caller to
+    /// reduce allocations by serializing directly to the [`Log`]'s internal buffer. The `cb` is
+    /// called twice, first to get the data length, second to write the data. It must produce the
+    /// same data.
+    ///
+    /// If `cb` returns an error, the operation is undone and the error is propagated.
+    pub fn append_direct<E>(
+        &mut self,
+        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
+    ) -> crate::Result<()>
+    where
+        // This works for anyhow::Error and crate::Error. Other error types will need to box.
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        self.append_internal(cb, None)
+    }
+
+    /// Append data written by `cb` to the [`Log`].
+    ///
+    /// If known, specifying size of data to be written via `data_len` saves a call to `cb`.
+    pub(crate) fn append_internal<E>(
+        &mut self,
+        cb: impl Fn(&mut dyn ExtendWrite) -> Result<(), E>,
+        data_len: Option<usize>,
+    ) -> crate::Result<()>
+    where
+        // This works for anyhow::Error and crate::Error. Other error types will need to box.
+        E: Into<Box<dyn std::error::Error + Send + Sync + 'static>>,
+    {
+        let result: crate::Result<_> = (|| {
+            let data_len = match data_len {
+                Some(data_len) => data_len,
+                None => {
+                    // Get length of data by passing a byte-counting writer to the callback.
+                    let mut counter = WriteCounter { len: 0 };
+
+                    if let Err(err) = cb(&mut counter) {
+                        return Err(crate::Error::blank()
+                            .message("append_direct callback error")
+                            .source_dyn(err.into()));
+                    }
+
+                    counter.len as usize
+                }
+            };
 
             let checksum_type = if self.open_options.checksum_type == ChecksumType::Auto {
                 // xxhash64 is slower for smaller data. A quick benchmark on x64 platform shows:
@@ -277,7 +353,7 @@ impl Log {
                 //  120       3000      3428
                 //  128       3459      4266
                 const XXHASH64_THRESHOLD: usize = 88;
-                if data.len() >= XXHASH64_THRESHOLD {
+                if data_len >= XXHASH64_THRESHOLD {
                     ChecksumType::Xxhash64
                 } else {
                     ChecksumType::Xxhash32
@@ -302,27 +378,65 @@ impl Log {
                 ChecksumType::Auto => unreachable!(),
             };
 
+            let mem_buf_start_len = self.mem_buf.len();
+
             self.mem_buf.write_vlq(entry_flags).infallible()?;
-            self.mem_buf.write_vlq(data.len()).infallible()?;
+            self.mem_buf.write_vlq(data_len as u64).infallible()?;
+
+            let checksum_offset = self.mem_buf.len();
+
+            // Reserve space for writing the checksum.
+            let checksum_len = match checksum_type {
+                ChecksumType::Auto => unreachable!(),
+                ChecksumType::Xxhash64 => 8,
+                ChecksumType::Xxhash32 => 4,
+            };
+            let data_offset = checksum_offset + checksum_len;
+            self.mem_buf.resize(data_offset, 0);
+
+            if let Err(err) = cb(Pin::as_mut(&mut self.mem_buf).get_mut()) {
+                // User error producing the bytes to serialize - undo whatever we've done so far.
+                self.mem_buf.truncate(mem_buf_start_len);
+                return Err(crate::Error::blank()
+                    .message("append_direct callback error")
+                    .source_dyn(err.into()));
+            }
+
+            // Make sure we wrote the expected amount of data.
+            let apparent_len = self.mem_buf.len() - data_offset;
+            if data_len != apparent_len {
+                self.mem_buf.truncate(mem_buf_start_len);
+                return Err(crate::Error::blank().message(format!("append_direct length mismatch: {data_len} (expected) != {apparent_len} (apparent)")));
+            }
 
             match checksum_type {
                 ChecksumType::Xxhash64 => {
-                    self.mem_buf
-                        .write_u64::<LittleEndian>(xxhash(data))
+                    let hash = xxhash(&self.mem_buf[data_offset..]);
+                    (&mut self.mem_buf[checksum_offset..])
+                        .write_u64::<LittleEndian>(hash)
                         .infallible()?;
                 }
                 ChecksumType::Xxhash32 => {
-                    self.mem_buf
-                        .write_u32::<LittleEndian>(xxhash32(data))
+                    let hash = xxhash32(&self.mem_buf[data_offset..]);
+                    (&mut self.mem_buf[checksum_offset..])
+                        .write_u32::<LittleEndian>(hash)
                         .infallible()?;
                 }
                 ChecksumType::Auto => unreachable!(),
             };
-            let data_offset = self.meta.primary_len + self.mem_buf.len() as u64;
 
-            self.mem_buf.write_all(data).infallible()?;
-            self.update_indexes_for_in_memory_entry(data, offset, data_offset)?;
-            self.update_fold_for_in_memory_entry(data, offset, data_offset)?;
+            let log_data_offset = self.meta.primary_len + data_offset as u64;
+
+            self.update_indexes_for_in_memory_entry(
+                data_offset..self.mem_buf.len(),
+                offset,
+                log_data_offset,
+            )?;
+            self.update_fold_for_in_memory_entry(
+                data_offset..self.mem_buf.len(),
+                offset,
+                log_data_offset,
+            )?;
 
             if let Some(threshold) = self.open_options.auto_sync_threshold {
                 if self.mem_buf.len() as u64 >= threshold {
@@ -335,16 +449,7 @@ impl Log {
             Ok(())
         })();
 
-        result
-            .context(|| {
-                let data = data.as_ref();
-                if data.len() < 128 {
-                    format!("in Log::append({:?})", data)
-                } else {
-                    format!("in Log::append(<a {}-byte long slice>)", data.len())
-                }
-            })
-            .context(|| format!("  Log.dir = {:?}", self.dir))
+        result.context(|| format!("  Log.dir = {:?}", self.dir))
     }
 
     /// Remove dirty (in-memory) state. Restore the [`Log`] to the state as
@@ -430,10 +535,11 @@ impl Log {
                 &self.disk_folds
             }
             .clone(),
-            index_corrupted: false,
+            index_out_of_sync: None,
             open_options: self.open_options.clone(),
             reader_lock,
             change_detector: self.change_detector.clone(),
+            prev_btrfs_metadata: self.prev_btrfs_metadata,
         };
 
         if !copy_dirty {
@@ -645,7 +751,7 @@ impl Log {
             let (disk_buf, indexes) = Self::load_log_and_indexes(
                 &self.dir,
                 &meta,
-                &self.open_options.index_defs,
+                &self.open_options,
                 &self.mem_buf,
                 if changed {
                     // Existing indexes cannot be reused.
@@ -666,7 +772,6 @@ impl Log {
                     Self::set_index_log_len(self.indexes.iter_mut(), meta.primary_len);
                     Some(&self.indexes)
                 },
-                self.open_options.fsync,
             )?;
 
             self.disk_buf = disk_buf;
@@ -694,6 +799,21 @@ impl Log {
             .context(|| format!("  Log.dir = {:?}", self.dir))
     }
 
+    pub(crate) fn btrfs_size(&mut self) -> crate::Result<u64> {
+        match &self.dir {
+            GenericPath::Filesystem(dir) => {
+                let log_path = dir.join(PRIMARY_FILE);
+                let log_file = File::open(&log_path)
+                    .context(&log_path, "opening log to perform btrfs size check")?;
+                let btrfs_metadata = btrfs::physical_size(&log_file, self.prev_btrfs_metadata)
+                    .context(&log_path, "reading btrfs size")?;
+                self.prev_btrfs_metadata = Some(btrfs_metadata);
+                Ok(btrfs_metadata.size())
+            }
+            _ => Err("btrfs_size only supported for normal filesystem logs".into()),
+        }
+    }
+
     pub(crate) fn update_change_detector_to_match_meta(&self) {
         if let Some(detector) = &self.change_detector {
             detector.set(self.meta.primary_len ^ self.meta.epoch);
@@ -711,8 +831,7 @@ impl Log {
     ) -> crate::Result<()> {
         for &index_id in index_ids.iter() {
             let metaname = self.open_options.index_defs[index_id].metaname();
-            let new_length = self.indexes[index_id].flush();
-            let new_length = self.maybe_set_index_error(new_length)?;
+            let new_length = self.indexes[index_id].flush()?;
             self.meta.indexes.insert(metaname, new_length);
             trace!(
                 name = "Log::flush_lagging_index",
@@ -823,8 +942,7 @@ impl Log {
 
                 // Flush all indexes.
                 for i in 0..self.indexes.len() {
-                    let new_length = self.indexes[i].flush();
-                    let new_length = self.maybe_set_index_error(new_length)?;
+                    let new_length = self.indexes[i].flush()?;
                     let name = self.open_options.index_defs[i].metaname();
                     self.meta.indexes.insert(name, new_length);
                 }
@@ -966,7 +1084,11 @@ impl Log {
     /// `index_defs` passed to [`Log::open`].
     ///
     /// Return an iterator of `Result<&[u8]>`, in reverse insertion order.
-    pub fn lookup<K: AsRef<[u8]>>(&self, index_id: usize, key: K) -> crate::Result<LogLookupIter> {
+    pub fn lookup<K: AsRef<[u8]>>(
+        &self,
+        index_id: usize,
+        key: K,
+    ) -> crate::Result<LogLookupIter<'_>> {
         let result: crate::Result<_> = (|| {
             self.maybe_return_index_error()?;
             if let Some(index) = self.indexes.get(index_id) {
@@ -1003,7 +1125,7 @@ impl Log {
         &self,
         index_id: usize,
         prefix: K,
-    ) -> crate::Result<LogRangeIter> {
+    ) -> crate::Result<LogRangeIter<'_>> {
         let prefix = prefix.as_ref();
         let result: crate::Result<_> = (|| {
             let index = self.indexes.get(index_id).unwrap();
@@ -1032,7 +1154,7 @@ impl Log {
         &self,
         index_id: usize,
         range: impl RangeBounds<&'a [u8]>,
-    ) -> crate::Result<LogRangeIter> {
+    ) -> crate::Result<LogRangeIter<'_>> {
         let start = range.start_bound();
         let end = range.end_bound();
         let result: crate::Result<_> = (|| {
@@ -1065,7 +1187,7 @@ impl Log {
         &self,
         index_id: usize,
         hex_prefix: K,
-    ) -> crate::Result<LogRangeIter> {
+    ) -> crate::Result<LogRangeIter<'_>> {
         let prefix = hex_prefix.as_ref();
         let result: crate::Result<_> = (|| {
             let index = self.indexes.get(index_id).unwrap();
@@ -1083,7 +1205,7 @@ impl Log {
     }
 
     /// Return an iterator for all entries.
-    pub fn iter(&self) -> LogIter {
+    pub fn iter(&self) -> LogIter<'_> {
         LogIter {
             log: self,
             next_offset: PRIMARY_START_OFFSET,
@@ -1094,7 +1216,7 @@ impl Log {
     /// Return an iterator for in-memory entries that haven't been flushed to disk.
     ///
     /// For in-memory Logs, this is the same as [`Log::iter`].
-    pub fn iter_dirty(&self) -> LogIter {
+    pub fn iter_dirty(&self) -> LogIter<'_> {
         LogIter {
             log: self,
             next_offset: self.meta.primary_len,
@@ -1150,21 +1272,23 @@ impl Log {
     /// length, and checksum header in the entry).
     fn update_indexes_for_in_memory_entry(
         &mut self,
-        data: &[u8],
+        mem_offset: Range<usize>,
         offset: u64,
         data_offset: u64,
     ) -> crate::Result<()> {
-        let result = self.update_indexes_for_in_memory_entry_unchecked(data, offset, data_offset);
-        self.maybe_set_index_error(result)
+        let result =
+            self.update_indexes_for_in_memory_entry_unchecked(mem_offset, offset, data_offset);
+        self.maybe_set_index_out_of_sync(result)
     }
 
     /// Similar to `update_indexes_for_in_memory_entry`. But updates `fold` instead.
     fn update_fold_for_in_memory_entry(
         &mut self,
-        data: &[u8],
+        mem_offset: Range<usize>,
         offset: u64,
         data_offset: u64,
     ) -> crate::Result<()> {
+        let data = &self.mem_buf[mem_offset];
         for fold_state in self.all_folds.iter_mut() {
             fold_state.process_entry(data, offset, data_offset + data.len() as u64)?;
         }
@@ -1173,10 +1297,11 @@ impl Log {
 
     fn update_indexes_for_in_memory_entry_unchecked(
         &mut self,
-        data: &[u8],
+        mem_offset: Range<usize>,
         offset: u64,
         data_offset: u64,
     ) -> crate::Result<()> {
+        let data = &self.mem_buf[mem_offset];
         for (index, def) in self.indexes.iter_mut().zip(&self.open_options.index_defs) {
             for index_output in (def.func)(data) {
                 match index_output {
@@ -1227,7 +1352,7 @@ impl Log {
     /// Returns number of entries built per index.
     fn update_indexes_for_on_disk_entries(&mut self) -> crate::Result<()> {
         let result = self.update_indexes_for_on_disk_entries_unchecked();
-        self.maybe_set_index_error(result)
+        self.maybe_set_index_out_of_sync(result)
     }
 
     fn update_indexes_for_on_disk_entries_unchecked(&mut self) -> crate::Result<()> {
@@ -1348,13 +1473,37 @@ impl Log {
     fn load_log_and_indexes(
         dir: &GenericPath,
         meta: &LogMetadata,
-        index_defs: &[IndexDef],
+        open_options: &OpenOptions,
         mem_buf: &Pin<Box<Vec<u8>>>,
         reuse_indexes: Option<&Vec<Index>>,
-        fsync: bool,
     ) -> crate::Result<(Bytes, Vec<Index>)> {
         let primary_buf = match dir.as_opt_path() {
-            Some(dir) => mmap_path(&dir.join(PRIMARY_FILE), meta.primary_len)?,
+            Some(dir) => {
+                let primary_path = dir.join(PRIMARY_FILE);
+                if open_options.btrfs_compression {
+                    // Setting the btrfs property requires write access and must be done before mmap.
+                    if let Ok(file) = std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&primary_path)
+                    {
+                        if let Err(err) = btrfs::set_property(&file, "btrfs.compression", "zstd") {
+                            tracing::warn!(
+                                file = %primary_path.display(),
+                                ?err,
+                                "error setting btrfs compression"
+                            );
+                        }
+                        // Reuse the file since we already have it open.
+                        mmap_bytes(&file, Some(meta.primary_len))
+                            .context(&primary_path, "cannot mmap")?
+                    } else {
+                        mmap_path(&primary_path, meta.primary_len)?
+                    }
+                } else {
+                    mmap_path(&primary_path, meta.primary_len)?
+                }
+            }
             None => Bytes::new(),
         };
 
@@ -1365,6 +1514,8 @@ impl Log {
             disk_len: meta.primary_len,
             mem_buf,
         });
+
+        let index_defs = &open_options.index_defs;
 
         let indexes = match reuse_indexes {
             None => {
@@ -1377,7 +1528,7 @@ impl Log {
                         def,
                         index_len,
                         key_buf.clone(),
-                        fsync,
+                        open_options.fsync,
                     )?);
                 }
                 indexes
@@ -1390,7 +1541,7 @@ impl Log {
                 for (index, def) in indexes.iter().zip(index_defs) {
                     let index_len = meta.indexes.get(&def.metaname()).cloned().unwrap_or(0);
                     let index = if index_len > Self::get_index_log_len(index, true).unwrap_or(0) {
-                        Self::load_index(dir, def, index_len, key_buf.clone(), fsync)?
+                        Self::load_index(dir, def, index_len, key_buf.clone(), open_options.fsync)?
                     } else {
                         let mut index = index.try_clone()?;
                         index.key_buf = key_buf.clone();
@@ -1449,7 +1600,7 @@ impl Log {
     /// Read the entry at the given offset. Return `None` if offset is out of bound, or the content
     /// of the data, the real offset of the data, and the next offset. Raise errors if
     /// integrity-check failed.
-    fn read_entry(&self, offset: u64) -> crate::Result<Option<EntryResult>> {
+    fn read_entry(&self, offset: u64) -> crate::Result<Option<EntryResult<'_>>> {
         let result = if offset < self.meta.primary_len {
             let entry = Self::read_entry_from_buf(&self.dir, &self.disk_buf, offset)?;
             if let Some(ref entry) = entry {
@@ -1567,19 +1718,19 @@ impl Log {
     /// Wrapper around a `Result` returned by an index write operation.
     /// Make sure all index write operations are wrapped by this method.
     #[inline]
-    fn maybe_set_index_error<T>(&mut self, result: crate::Result<T>) -> crate::Result<T> {
-        if result.is_err() && !self.index_corrupted {
-            self.index_corrupted = true;
+    fn maybe_set_index_out_of_sync<T>(&mut self, result: crate::Result<T>) -> crate::Result<T> {
+        if let (Err(e), None) = (&result, &self.index_out_of_sync) {
+            self.index_out_of_sync = Some(format!("{} ({:?})", e, e));
         }
         result
     }
 
-    /// Wrapper to return an error if `index_corrupted` is set.
+    /// Wrapper to return an error if `index_out_of_sync` is set.
     /// Use this before doing index read operations.
     #[inline]
     fn maybe_return_index_error(&self) -> crate::Result<()> {
-        if self.index_corrupted {
-            let msg = "index is corrupted".to_string();
+        if let Some(msg) = &self.index_out_of_sync {
+            let msg = format!("index was out of sync: {}", msg);
             Err(self.corruption(msg))
         } else {
             Ok(())
@@ -1858,5 +2009,38 @@ impl ReadonlyBuffer for ExternalKeyBuffer {
             let mem_buf = unsafe { &*self.mem_buf };
             mem_buf.get((start as usize)..(start + len) as usize)
         }
+    }
+}
+
+// Wraps infallible writer (like Vec<u8>) to implement std::io::Write and provide infallible
+// extend_from_slice(), but hide the ability to change previous data in the vector.
+pub trait ExtendWrite: Write {
+    fn extend_from_slice(&mut self, buf: &[u8]);
+}
+
+impl ExtendWrite for Vec<u8> {
+    fn extend_from_slice(&mut self, buf: &[u8]) {
+        Vec::extend_from_slice(self, buf);
+    }
+}
+
+struct WriteCounter {
+    len: u64,
+}
+
+impl ExtendWrite for WriteCounter {
+    fn extend_from_slice(&mut self, buf: &[u8]) {
+        self.len += buf.len() as u64;
+    }
+}
+
+impl Write for WriteCounter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.len += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

@@ -186,18 +186,18 @@ FilteredObjectIdType FilteredObjectId::objectType() const {
 // the same underlying object. However, that's not for the FilteredObjectId
 // implementation to decide. This implementation strictly checks if the FOID
 // contents are byte-wise equal.
-bool FilteredObjectId::operator==(const FilteredObjectId& otherHash) const {
-  return value_ == otherHash.value_;
+bool FilteredObjectId::operator==(const FilteredObjectId& otherId) const {
+  return value_ == otherId.value_;
 }
 
 // The comment above for == also applies here.
-bool FilteredObjectId::operator<(const FilteredObjectId& otherHash) const {
-  return value_ < otherHash.value_;
+bool FilteredObjectId::operator<(const FilteredObjectId& otherId) const {
+  return value_ < otherId.value_;
 }
 
 void FilteredObjectId::validate() {
   ByteRange infoBytes = folly::Range{value_.data(), value_.size()};
-  XLOGF(DBG9, "{}", value_);
+  XLOG(DBG9, value_);
 
   // Ensure the type byte is valid
   auto typeByte = infoBytes.front();
@@ -206,7 +206,7 @@ void FilteredObjectId::validate() {
       typeByte != FilteredObjectIdType::OBJECT_TYPE_UNFILTERED_TREE) {
     auto msg = fmt::format(
         "Invalid FilteredObjectId type byte {}. Value_ = {}", typeByte, value_);
-    XLOGF(ERR, "{}", msg);
+    XLOG(ERR, msg);
     throw std::invalid_argument(msg);
   }
   static_assert(

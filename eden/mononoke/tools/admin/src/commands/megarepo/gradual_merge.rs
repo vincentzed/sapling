@@ -160,7 +160,11 @@ async fn find_unmerged_commits(
 
     let bookmark_value = repo
         .bookmarks()
-        .get(ctx.clone(), bookmark_to_merge_into)
+        .get(
+            ctx.clone(),
+            bookmark_to_merge_into,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| anyhow::anyhow!("Bookmark {bookmark_to_merge_into} doesn't exist"))?;
 
@@ -237,7 +241,11 @@ async fn push_merge_commit(
     info!(ctx.logger(), "Preparing to merge {}", cs_id_to_merge);
     let bookmark_value = repo
         .bookmarks()
-        .get(ctx.clone(), bookmark_to_merge_into)
+        .get(
+            ctx.clone(),
+            bookmark_to_merge_into,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .ok_or_else(|| anyhow::anyhow!("Bookmark {bookmark_to_merge_into} doesn't exist"))?;
 
@@ -445,7 +453,7 @@ mod test {
         // Now merge a single commit into "head"
         let head_value = repo
             .bookmarks()
-            .get(ctx.clone(), &head)
+            .get(ctx.clone(), &head, bookmarks::Freshness::MostRecent)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Bookmark {} doesn't exist", head))?;
 
@@ -467,7 +475,7 @@ mod test {
         // Merge next commit into head
         let head_value = repo
             .bookmarks()
-            .get(ctx.clone(), &head)
+            .get(ctx.clone(), &head, bookmarks::Freshness::MostRecent)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Bookmark {} doesn't exist", head))?;
 

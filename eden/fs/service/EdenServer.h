@@ -66,6 +66,7 @@ class Dirstate;
 class EdenConfig;
 class EdenMount;
 class EdenServiceHandler;
+class HeartbeatManager;
 class SaplingBackingStore;
 class IScribeLogger;
 class Journal;
@@ -342,7 +343,7 @@ class EdenServer : private TakeoverHandler {
 
   ImmediateFuture<CheckoutResult> checkOutRevision(
       AbsolutePathPiece mountPath,
-      std::string& rootHash,
+      std::string& rootId,
       std::optional<folly::StringPiece> rootHgManifest,
       const ObjectFetchContextPtr& fetchContext,
       folly::StringPiece callerName,
@@ -401,8 +402,7 @@ class EdenServer : private TakeoverHandler {
   void createOrUpdateEdenHeartbeatFile();
   void createDaemonExitSignalFile(int signal);
   void removeEdenHeartbeatFile() const;
-  void removeDaemonExitSignalFile() const;
-  int readDaemonExitSignal() const;
+  bool checkForPreviousHeartbeat(bool takeover);
 #endif
 
   const std::shared_ptr<ServerState>& getServerState() const {
@@ -711,10 +711,6 @@ class EdenServer : private TakeoverHandler {
 
   const std::vector<std::string> originalCommandLine_;
   EdenStateDir edenDir_;
-  AbsolutePath heartbeatFilePath_;
-  const char* heartbeatFilePathString_;
-  AbsolutePath daemonExitSignalFilePath_;
-  const char* daemonExitSignalFilePathString_;
 
   // During graceful restart, this will be the pid of the old edenfs daemon.
   // This is used because at some point we have both edenfs daemon processes
@@ -806,6 +802,11 @@ class EdenServer : private TakeoverHandler {
    * Notifications telemetry logger.
    */
   std::shared_ptr<StructuredLogger> notificationsStructuredLogger_;
+
+  /**
+   * HeartbeatManager to handle all heartbeat-related operations
+   */
+  std::unique_ptr<HeartbeatManager> heartbeatManager_;
 
   /**
    * Common state shared by all of the EdenMount objects.

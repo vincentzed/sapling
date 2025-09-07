@@ -72,6 +72,7 @@ use metaconfig_types::BlameVersion;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use metaconfig_types::GitDeltaManifestV2Config;
+use metaconfig_types::GitDeltaManifestV3Config;
 use metaconfig_types::HookManagerParams;
 use metaconfig_types::InferredCopyFromConfig;
 use metaconfig_types::InfinitepushNamespace;
@@ -187,6 +188,12 @@ pub fn default_test_repo_derived_data_types_config() -> DerivedDataTypesConfig {
             max_inlined_object_size: 100,
             max_inlined_delta_size: 100,
             delta_chunk_size: 1000,
+        }),
+        git_delta_manifest_v3_config: Some(GitDeltaManifestV3Config {
+            max_inlined_object_size: 100,
+            max_inlined_delta_size: 100,
+            delta_chunk_size: 1000,
+            entry_chunk_size: 1000,
         }),
         inferred_copy_from_config: Some(InferredCopyFromConfig {
             dir_level_for_basename_lookup: 1,
@@ -806,6 +813,7 @@ impl TestRepoFactory {
         bonsai_tag_mapping: &ArcBonsaiTagMapping,
         bonsai_git_mapping: &ArcBonsaiGitMapping,
         repo_cross_repo: &ArcRepoCrossRepo,
+        commit_graph: &ArcCommitGraph,
     ) -> ArcHookManager {
         let hook_repo = HookRepo {
             repo_identity: repo_identity.clone(),
@@ -816,6 +824,7 @@ impl TestRepoFactory {
             bonsai_git_mapping: bonsai_git_mapping.clone(),
             bonsai_tag_mapping: bonsai_tag_mapping.clone(),
             repo_cross_repo: repo_cross_repo.clone(),
+            commit_graph: commit_graph.clone(),
         };
 
         Arc::new(HookManager::new_test(

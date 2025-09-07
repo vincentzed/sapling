@@ -21,6 +21,8 @@ use itertools::Itertools;
 use maplit::hashmap;
 use maplit::hashset;
 use memcache::KeyGen;
+#[cfg(fbcode_build)]
+use mysql_client::MysqlError;
 use sql_query_config::CachingConfig;
 
 const RETRY_ATTEMPTS: usize = 2;
@@ -44,7 +46,7 @@ macro_rules! mononoke_queries {
         $vi:vis read $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) -> ($( $rtype:ty ),* $(,)*) { $q:expr_2021 }
+        ) -> ($( $rtype:ty ),* $(,)*) { $q:expr }
         $( $rest:tt )*
     ) => {
         $crate::mononoke_queries! {
@@ -60,7 +62,7 @@ macro_rules! mononoke_queries {
         $vi:vis cacheable read $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) -> ($( $rtype:ty ),* $(,)*) { $q:expr_2021 }
+        ) -> ($( $rtype:ty ),* $(,)*) { $q:expr }
         $( $rest:tt )*
     ) => {
         $crate::mononoke_queries! {
@@ -77,7 +79,7 @@ macro_rules! mononoke_queries {
         $vi:vis read $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) -> ($( $rtype:ty ),* $(,)*) { mysql($mysql_q:expr_2021) sqlite($sqlite_q:expr_2021) }
+        ) -> ($( $rtype:ty ),* $(,)*) { mysql($mysql_q:expr) sqlite($sqlite_q:expr) }
         $( $rest:tt )*
     ) => {
         $crate::_macro_internal::paste::item! {
@@ -103,15 +105,15 @@ macro_rules! mononoke_queries {
                     $( $pname: &$ptype, )*
                     $( $lname: &[ $ltype ], )*
                 ) -> Result<Vec<($( $rtype, )*)>> {
+                    let query_name = stringify!($name);
+                    let shard_name = connection.shard_name();
                     query_with_retry_no_cache(
                         || {
                             borrowed!(sql_query_tel);
                             async move {
-                                let query_name = stringify!($name);
                                 let cri = sql_query_tel.client_request_info();
                                 // Convert ClientRequestInfo to string if present
                                 let cri_str = cri.map(|cri| serde_json::to_string(cri)).transpose()?;
-                                let shard_name = connection.shard_name();
 
                                 let granularity = TelemetryGranularity::Query;
 
@@ -147,6 +149,8 @@ macro_rules! mononoke_queries {
                                 Ok(res)
                             }
                         },
+                        shard_name,
+                        query_name,
                     ).await
                 }
 
@@ -179,7 +183,7 @@ macro_rules! mononoke_queries {
         $vi:vis cacheable read $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) -> ($( $rtype:ty ),* $(,)*) { mysql($mysql_q:expr_2021) sqlite($sqlite_q:expr_2021) }
+        ) -> ($( $rtype:ty ),* $(,)*) { mysql($mysql_q:expr) sqlite($sqlite_q:expr) }
         $( $rest:tt )*
     ) => {
         $crate::_macro_internal::paste::item! {
@@ -221,17 +225,17 @@ macro_rules! mononoke_queries {
                     let key = hasher.finish_ext();
                     let data = CacheData {key, config: config.caching.as_ref(), cache_ttl };
 
+                    let query_name = stringify!($name);
+                    let shard_name = connection.shard_name();
                     // Execute query with caching
                     let res = query_with_retry(
                         data,
                         || {
                             borrowed!(sql_query_tel);
+                            let cri = sql_query_tel.client_request_info();
                             async move {
-                                let query_name = stringify!($name);
-                                let cri = sql_query_tel.client_request_info();
                                 // Convert ClientRequestInfo to string if present
                                 let cri_str = cri.map(|cri| serde_json::to_string(&cri)).transpose()?;
-                                let shard_name = connection.shard_name();
 
                                 let granularity = TelemetryGranularity::Query;
 
@@ -267,6 +271,8 @@ macro_rules! mononoke_queries {
                                 Ok(CachedQueryResult(res))
                             }
                         },
+                        shard_name,
+                        query_name,
                     ).await?.0;
 
                     Ok(res)
@@ -301,7 +307,7 @@ macro_rules! mononoke_queries {
         $vi:vis write $name:ident (
             values: ($( $vname:ident: $vtype:ty ),* $(,)*)
             $( , $pname:ident: $ptype:ty )* $(,)*
-        ) { $qtype:ident, $q:expr_2021 }
+        ) { $qtype:ident, $q:expr }
         $( $rest:tt )*
     ) => {
         $crate::mononoke_queries! {
@@ -318,7 +324,7 @@ macro_rules! mononoke_queries {
         $vi:vis write $name:ident (
             values: ($( $vname:ident: $vtype:ty ),* $(,)*)
             $( , $pname:ident: $ptype:ty )* $(,)*
-        ) { $qtype:ident, mysql($mysql_q:expr_2021) sqlite($sqlite_q:expr_2021) }
+        ) { $qtype:ident, mysql($mysql_q:expr) sqlite($sqlite_q:expr) }
         $( $rest:tt )*
     ) => {
         $crate::_macro_internal::paste::item! {
@@ -370,6 +376,8 @@ macro_rules! mononoke_queries {
                             values
                             $( , $pname )*
                         ),
+                        shard_name,
+                        query_name,
                     ).await.inspect_err(|e| {
                         log_query_error(
                             &sql_query_tel,
@@ -471,7 +479,7 @@ macro_rules! mononoke_queries {
         $vi:vis write $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) { $qtype:ident, $q:expr_2021 }
+        ) { $qtype:ident, $q:expr }
         $( $rest:tt )*
     ) => {
         $crate::mononoke_queries! {
@@ -488,7 +496,7 @@ macro_rules! mononoke_queries {
         $vi:vis write $name:ident (
             $( $pname:ident: $ptype:ty ),* $(,)*
             $( >list $lname:ident: $ltype:ty )*
-        ) { $qtype:ident, mysql($mysql_q:expr_2021) sqlite($sqlite_q:expr_2021) }
+        ) { $qtype:ident, mysql($mysql_q:expr) sqlite($sqlite_q:expr) }
         $( $rest:tt )*
     ) => {
         $crate::_macro_internal::paste::item! {
@@ -532,6 +540,8 @@ macro_rules! mononoke_queries {
                             $( $pname, )*
                             $( $lname, )*
                         ),
+                        shard_name,
+                        query_name,
                     ).await.inspect_err(|e| {
                         log_query_error(
                             &sql_query_tel,
@@ -824,6 +834,8 @@ where
 
 pub async fn query_with_retry_no_cache<T, Fut>(
     do_query: impl Fn() -> Fut + Send + Sync,
+    shard_name: &str,
+    query_name: &str,
 ) -> Result<T>
 where
     T: Send + 'static,
@@ -836,6 +848,32 @@ where
         .exponential_backoff(1.2)
         .jitter(Duration::from_secs(5))
         .max_attempts(RETRY_ATTEMPTS)
+        .inspect_err(|attempt, e| {
+            #[cfg(fbcode_build)]
+            if let Some(e) = e.downcast_ref::<MysqlError>() {
+                use stats::prelude::DynamicTimeseries;
+
+                use crate::telemetry::STATS;
+
+                // Get just the enum variant name using std::any::type_name
+                let error_type = std::any::type_name_of_val(e)
+                    .split("::")
+                    .last()
+                    .unwrap_or("Unknown");
+
+                let error_key = if let Some(mysql_errno) = e.mysql_errno() {
+                    format!("{error_type}.{mysql_errno}")
+                } else {
+                    error_type.to_string()
+                };
+                STATS::query_retry_attempts.add_value(
+                    attempt as i64,
+                    (shard_name.to_string(), query_name.to_string(), error_key),
+                );
+            };
+            #[cfg(not(fbcode_build))]
+            let _ = (attempt, shard_name, query_name, e);
+        })
         .await?
         .0)
 }
@@ -843,6 +881,8 @@ where
 pub async fn query_with_retry<T, Fut>(
     cache_data: CacheData<'_>,
     do_query: impl Fn() -> Fut + Send + Sync,
+    shard_name: &str,
+    query_name: &str,
 ) -> Result<CachedQueryResult<Vec<T>>>
 where
     T: Send + bincode::Encode + bincode::Decode<()> + Clone + 'static,
@@ -850,9 +890,9 @@ where
     Fut: Future<Output = Result<CachedQueryResult<Vec<T>>>> + Send,
 {
     if let Ok(true) = justknobs::eval("scm/mononoke:sql_disable_auto_cache", None, None) {
-        return query_with_retry_no_cache(&do_query).await;
+        return query_with_retry_no_cache(&do_query, shard_name, query_name).await;
     }
-    let fetch = || query_with_retry_no_cache(&do_query);
+    let fetch = || query_with_retry_no_cache(&do_query, shard_name, query_name);
     let key = cache_data.key;
     if let Some(config) = cache_data.config.as_ref() {
         let store = QueryCacheStore {

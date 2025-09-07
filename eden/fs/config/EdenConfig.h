@@ -645,6 +645,18 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Number of shards to use for the metadata cache.
+   *
+   * This is used to reduce lock contention on the metadata cache. Higher number
+   * means lower contention, but more imperfect LRU property (each shard has its
+   * own LRU).
+   */
+  ConfigSetting<uint64_t> metadataCacheShards{
+      "store:metadata-cache-shards",
+      32,
+      this};
+
+  /**
    * Controls if RocksDbLocalStore operations should run asynchronously or
    * synchronously.
    *
@@ -1611,6 +1623,18 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Controls whether we optimize blob prefetching with the Sapling
+   * IGNORE_RESULT flag, which reduces work by not propagating the actual
+   * blob result.
+   *
+   * This is an escape hatch in case something goes wrong.
+   */
+  ConfigSetting<bool> ignorePrefetchResult{
+      "experimental:ignore-prefetch-result",
+      true,
+      this};
+
+  /**
    * Controls whether eden rm command attempts to clean up mount directory
    * recursively. eden rm currently assumes nothing exist after unmounting and
    * directly removes the directory, which leads to ENOTEMPTY for lots of users.
@@ -2074,6 +2098,14 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::vector<RelativePath>> vcsDirectories{
       "notify:vcs-directories",
       {RelativePath{".hg"}, RelativePath{".git"}, RelativePath{".sl"}},
+      this};
+
+  /**
+   * In-repo location for notifications states
+   */
+  ConfigSetting<RelativePath> notificationsStateDirectory{
+      "notify:state-directory",
+      RelativePath{".edenfs-notifications-state"},
       this};
 
 // [facebook]

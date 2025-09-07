@@ -30,8 +30,10 @@ fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rus
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 futures-util = { version = "0.3.30", features = ["compat"] }
 futures_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+futures_retry = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 futures_watchdog = { version = "0.1.0", path = "../../common/futures_watchdog" }
+git_source_of_truth = { version = "0.1.0", path = "../../git_source_of_truth" }
 git_types = { version = "0.1.0", path = "../../git/git_types" }
 gix-hash = "0.18.0"
 hooks = { version = "0.1.0", path = "../../hooks" }
@@ -68,5 +70,5 @@ source_control_services = { version = "0.1.0", path = "../if/services" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 synced_commit_mapping = { version = "0.1.0", path = "../../commit_rewriting/synced_commit_mapping" }
 time_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.46.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.47.1", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }

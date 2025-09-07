@@ -69,33 +69,32 @@ FakeBackingStore::getTreeEntryForObjectId(
 ImmediateFuture<BackingStore::GetRootTreeResult> FakeBackingStore::getRootTree(
     const RootId& commitID,
     const ObjectFetchContextPtr& /*context*/) {
-  StoredHash* storedTreeHash;
+  StoredId* storedTreeId;
   {
     auto data = data_.wlock();
     ++data->commitAccessCounts[commitID];
     auto commitIter = data->commits.find(commitID);
     if (commitIter == data->commits.end()) {
       // Throw immediately, for the same reasons mentioned in getTree()
-      throw std::domain_error(
-          folly::to<std::string>("commit ", commitID, " not found"));
+      throw std::domain_error(fmt::format("commit {} not found", commitID));
     }
 
-    storedTreeHash = commitIter->second.get();
+    storedTreeId = commitIter->second.get();
   }
 
-  return storedTreeHash->getFuture()
-      .thenValue([this, commitID](const std::shared_ptr<ObjectId>& hash) {
+  return storedTreeId->getFuture()
+      .thenValue([this, commitID](const std::shared_ptr<ObjectId>& id) {
         auto data = data_.rlock();
-        auto treeIter = data->trees.find(*hash);
+        auto treeIter = data->trees.find(*id);
         if (treeIter == data->trees.end()) {
           return makeImmediateFuture<TreePtr>(std::domain_error(
-              fmt::format("tree {} for commit {} not found", *hash, commitID)));
+              fmt::format("tree {} for commit {} not found", *id, commitID)));
         }
 
         return treeIter->second->getFuture();
       })
-      .thenValue([storedTreeHash](TreePtr tree) {
-        return GetRootTreeResult{tree, storedTreeHash->get()};
+      .thenValue([storedTreeId](TreePtr tree) {
+        return GetRootTreeResult{tree, storedTreeId->get()};
       })
       .semi();
 }
@@ -207,12 +206,11 @@ std::pair<StoredBlob*, ObjectId> FakeBackingStore::putBlob(
 }
 
 StoredBlob* FakeBackingStore::putBlob(
-    ObjectId hash,
+    ObjectId id,
     folly::StringPiece contents) {
-  auto [storedBlob, id, inserted] = maybePutBlob(hash, contents);
+  auto [storedBlob, oid, inserted] = maybePutBlob(id, contents);
   if (!inserted) {
-    throw std::domain_error(
-        fmt::format("blob with hash {} already exists", hash));
+    throw std::domain_error(fmt::format("blob with id {} already exists", oid));
   }
   return storedBlob;
 }
@@ -223,15 +221,14 @@ std::tuple<StoredBlob*, ObjectId, bool> FakeBackingStore::maybePutBlob(
 }
 
 std::tuple<StoredBlob*, ObjectId, bool> FakeBackingStore::maybePutBlob(
-    ObjectId hash,
+    ObjectId id,
     folly::StringPiece contents) {
   auto storedBlob = make_unique<StoredBlob>(makeBlob(contents));
 
   {
     auto data = data_.wlock();
-    auto ret = data->blobs.emplace(hash, std::move(storedBlob));
-    return std::make_tuple(
-        ret.first->second.get(), std::move(hash), ret.second);
+    auto ret = data->blobs.emplace(id, std::move(storedBlob));
+    return std::make_tuple(ret.first->second.get(), std::move(id), ret.second);
   }
 }
 
@@ -268,36 +265,36 @@ FakeBackingStore::TreeEntryData::TreeEntryData(
     const Tree& tree)
     : entry{
           PathComponent{name},
-          TreeEntry{tree.getHash(), TreeEntryType::TREE}} {}
+          TreeEntry{tree.getObjectId(), TreeEntryType::TREE}} {}
 
 FakeBackingStore::TreeEntryData::TreeEntryData(
     folly::StringPiece name,
     const StoredTree* tree)
     : entry{
           PathComponent{name},
-          TreeEntry{tree->get().getHash(), TreeEntryType::TREE}} {}
+          TreeEntry{tree->get().getObjectId(), TreeEntryType::TREE}} {}
 
 StoredTree* FakeBackingStore::putTree(
     const std::initializer_list<TreeEntryData>& entryArgs) {
   auto entries = buildTreeEntries(entryArgs);
-  auto hash = computeTreeHash(entries);
-  return putTree(hash, entries);
+  auto id = computeTreeId(entries);
+  return putTree(id, entries);
 }
 
 StoredTree* FakeBackingStore::putTree(
-    ObjectId hash,
+    ObjectId id,
     const std::initializer_list<TreeEntryData>& entryArgs) {
   auto entries = buildTreeEntries(entryArgs);
-  return putTreeImpl(hash, std::move(entries));
+  return putTreeImpl(id, std::move(entries));
 }
 
 StoredTree* FakeBackingStore::putTree(Tree::container entries) {
-  auto hash = computeTreeHash(entries);
-  return putTreeImpl(hash, std::move(entries));
+  auto id = computeTreeId(entries);
+  return putTreeImpl(id, std::move(entries));
 }
 
-StoredTree* FakeBackingStore::putTree(ObjectId hash, Tree::container entries) {
-  return putTreeImpl(hash, std::move(entries));
+StoredTree* FakeBackingStore::putTree(ObjectId id, Tree::container entries) {
+  return putTreeImpl(id, std::move(entries));
 }
 
 std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
@@ -307,8 +304,8 @@ std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
 
 std::pair<StoredTree*, bool> FakeBackingStore::maybePutTree(
     Tree::container entries) {
-  auto hash = computeTreeHash(entries);
-  return maybePutTreeImpl(hash, std::move(entries));
+  auto id = computeTreeId(entries);
+  return maybePutTreeImpl(id, std::move(entries));
 }
 
 Tree::container FakeBackingStore::buildTreeEntries(
@@ -321,10 +318,9 @@ Tree::container FakeBackingStore::buildTreeEntries(
   return entries;
 }
 
-ObjectId FakeBackingStore::computeTreeHash(
-    const Tree::container& sortedEntries) {
+ObjectId FakeBackingStore::computeTreeId(const Tree::container& sortedEntries) {
   // Compute a SHA-1 hash over the entry contents.
-  // This doesn't match how we generate hashes for either git or mercurial
+  // This doesn't match how we generate ids for either git or mercurial
   // backed stores, but that doesn't really matter.  We only need to be
   // consistent within our own store.
   folly::ssl::OpenSSLHash::Digest digest;
@@ -332,7 +328,7 @@ ObjectId FakeBackingStore::computeTreeHash(
 
   for (const auto& entry : sortedEntries) {
     digest.hash_update(ByteRange{entry.first.view()});
-    digest.hash_update(entry.second.getHash().getBytes());
+    digest.hash_update(entry.second.getObjectId().getBytes());
     mode_t mode = modeFromTreeEntryType(entry.second.getType());
     digest.hash_update(
         ByteRange(reinterpret_cast<const uint8_t*>(&mode), sizeof(mode)));
@@ -345,57 +341,53 @@ ObjectId FakeBackingStore::computeTreeHash(
 }
 
 StoredTree* FakeBackingStore::putTreeImpl(
-    ObjectId hash,
+    ObjectId id,
     Tree::container&& sortedEntries) {
-  auto ret = maybePutTreeImpl(hash, std::move(sortedEntries));
+  auto ret = maybePutTreeImpl(id, std::move(sortedEntries));
   if (!ret.second) {
-    throw std::domain_error(
-        fmt::format("tree with hash {} already exists", hash));
+    throw std::domain_error(fmt::format("tree with id {} already exists", id));
   }
   return ret.first;
 }
 
 std::pair<StoredTree*, bool> FakeBackingStore::maybePutTreeImpl(
-    ObjectId hash,
+    ObjectId id,
     Tree::container&& sortedEntries) {
-  auto storedTree =
-      make_unique<StoredTree>(Tree{std::move(sortedEntries), hash});
+  auto storedTree = make_unique<StoredTree>(Tree{std::move(sortedEntries), id});
 
   {
     auto data = data_.wlock();
-    auto ret = data->trees.emplace(hash, std::move(storedTree));
+    auto ret = data->trees.emplace(id, std::move(storedTree));
     return std::make_pair(ret.first->second.get(), ret.second);
   }
 }
 
-StoredHash* FakeBackingStore::putCommit(
-    const RootId& commitHash,
+StoredId* FakeBackingStore::putCommit(
+    const RootId& commitId,
     const StoredTree* tree) {
-  return putCommit(commitHash, tree->get().getHash());
+  return putCommit(commitId, tree->get().getObjectId());
 }
 
-StoredHash* FakeBackingStore::putCommit(
-    const RootId& commitHash,
-    ObjectId treeHash) {
-  auto storedHash = make_unique<StoredHash>(treeHash);
+StoredId* FakeBackingStore::putCommit(const RootId& commitId, ObjectId treeId) {
+  auto storedId = make_unique<StoredId>(treeId);
   {
     auto data = data_.wlock();
-    auto ret = data->commits.emplace(commitHash, std::move(storedHash));
+    auto ret = data->commits.emplace(commitId, std::move(storedId));
     if (!ret.second) {
-      throw std::domain_error(folly::to<std::string>(
-          "commit with hash ", commitHash, " already exists"));
+      throw std::domain_error(
+          fmt::format("commit with id {} already exists", commitId));
     }
     return ret.first->second.get();
   }
 }
 
-StoredHash* FakeBackingStore::putCommit(
-    const RootId& commitHash,
+StoredId* FakeBackingStore::putCommit(
+    const RootId& commitId,
     const FakeTreeBuilder& builder) {
-  return putCommit(commitHash, builder.getRoot()->get().getHash());
+  return putCommit(commitId, builder.getRoot()->get().getObjectId());
 }
 
-StoredHash* FakeBackingStore::putCommit(
+StoredId* FakeBackingStore::putCommit(
     folly::StringPiece commitStr,
     const FakeTreeBuilder& builder) {
   return putCommit(RootId(commitStr.str()), builder);
@@ -414,20 +406,20 @@ StoredGlob* FakeBackingStore::putGlob(
   return ret.first->second.get();
 }
 
-StoredTree* FakeBackingStore::getStoredTree(ObjectId hash) {
+StoredTree* FakeBackingStore::getStoredTree(ObjectId id) {
   auto data = data_.rlock();
-  auto it = data->trees.find(hash);
+  auto it = data->trees.find(id);
   if (it == data->trees.end()) {
-    throw std::domain_error(fmt::format("stored tree {} not found", hash));
+    throw std::domain_error(fmt::format("stored tree {} not found", id));
   }
   return it->second.get();
 }
 
-StoredBlob* FakeBackingStore::getStoredBlob(ObjectId hash) {
+StoredBlob* FakeBackingStore::getStoredBlob(ObjectId id) {
   auto data = data_.rlock();
-  auto it = data->blobs.find(hash);
+  auto it = data->blobs.find(id);
   if (it == data->blobs.end()) {
-    throw std::domain_error(fmt::format("stored blob {} not found", hash));
+    throw std::domain_error(fmt::format("stored blob {} not found", id));
   }
   return it->second.get();
 }
@@ -471,7 +463,7 @@ void FakeBackingStore::discardOutstandingRequests() {
   }
 }
 
-size_t FakeBackingStore::getAccessCount(const ObjectId& hash) const {
-  return folly::get_default(data_.rlock()->accessCounts, hash, 0);
+size_t FakeBackingStore::getAccessCount(const ObjectId& id) const {
+  return folly::get_default(data_.rlock()->accessCounts, id, 0);
 }
 } // namespace facebook::eden

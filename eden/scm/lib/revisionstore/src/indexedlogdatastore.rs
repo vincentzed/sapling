@@ -53,6 +53,7 @@ pub struct IndexedLogHgIdDataStoreConfig {
     pub max_log_count: Option<u8>,
     pub max_bytes_per_log: Option<ByteCount>,
     pub max_bytes: Option<ByteCount>,
+    pub btrfs_compression: bool,
 }
 
 pub struct IndexedLogHgIdDataStore {
@@ -68,9 +69,6 @@ pub struct Entry {
 
     content: OnceCell<Bytes>,
     compressed_content: Option<Bytes>,
-
-    #[cfg(test)]
-    should_compress: bool,
 }
 
 impl std::cmp::PartialEq for Entry {
@@ -91,8 +89,6 @@ impl Entry {
             metadata,
             content: OnceCell::with_value(content),
             compressed_content: None,
-            #[cfg(test)]
-            should_compress: true,
         }
     }
 
@@ -136,8 +132,6 @@ impl Entry {
             metadata: metadata.api,
             content,
             compressed_content,
-            #[cfg(test)]
-            should_compress: true,
         })
     }
 
@@ -158,18 +152,11 @@ impl Entry {
     /// Write an entry to the IndexedLog. See [`from_log`] for the detail about the on-disk format.
     pub fn write_to_log(self, log: &Store) -> Result<()> {
         let mut buf = Vec::new();
-        self.serialize(&mut buf)?;
+        self.serialize(&mut buf, log.should_compress())?;
         log.write().append(buf)
     }
 
-    fn serialize(&self, buf: &mut Vec<u8>) -> Result<()> {
-        #[cfg(test)]
-        let should_compress = self.should_compress;
-
-        #[cfg(not(test))]
-        // Always compress for now (compatible with old and new code).
-        let should_compress = true;
-
+    fn serialize(&self, buf: &mut dyn Write, should_compress: bool) -> Result<()> {
         buf.write_all(self.node.as_ref())?;
 
         // write empty name (i.e. zero length)
@@ -212,7 +199,7 @@ impl Entry {
     }
 
     // Pre-compress content in preparation for insertion into cache.
-    pub fn compress_content(&mut self) -> Result<()> {
+    fn compress_content(&mut self) -> Result<()> {
         if self.compressed_content.is_some() {
             return Ok(());
         }
@@ -274,6 +261,7 @@ impl IndexedLogHgIdDataStore {
             .auto_sync_threshold(50 * 1024 * 1024)
             .load_specific_config(config, "hgdata")
             .create(true)
+            .btrfs_compression(log_config.btrfs_compression)
             .index("node", |_| {
                 vec![IndexOutput::Reference(0..HgId::len() as u64)]
             });
@@ -356,14 +344,24 @@ impl IndexedLogHgIdDataStore {
     }
 
     pub fn put_batch(&self, entries: Vec<(HgId, Entry)>) -> Result<()> {
+        let compress = self.store.should_compress();
         self.store.append_batch(
             entries,
-            |_, entry, buf| entry.serialize(buf),
+            |_, entry, buf| entry.serialize(buf, compress),
             // Files and trees are, in general, not remotely fetched when they are already in local
             // caches, so we don't need to do an extra read-before-write before inserting into
             // cache.
             false,
         )
+    }
+
+    /// Pre-compress content of entry if compression is enabled.
+    pub fn maybe_compress_content(&self, entry: &mut Entry) -> Result<()> {
+        if !self.store.should_compress() {
+            return Ok(());
+        }
+
+        entry.compress_content()
     }
 }
 
@@ -483,6 +481,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -502,6 +501,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -530,6 +530,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -554,6 +555,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -574,6 +576,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -595,6 +598,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -622,6 +626,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -655,6 +660,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -686,6 +692,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -716,6 +723,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -760,6 +768,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let local = Arc::new(IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -805,6 +814,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let local = Arc::new(IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -845,6 +855,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -904,6 +915,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
         let log = IndexedLogHgIdDataStore::new(
             &BTreeMap::<&str, &str>::new(),
@@ -930,6 +942,7 @@ mod tests {
             max_log_count: None,
             max_bytes_per_log: None,
             max_bytes: None,
+            btrfs_compression: false,
         };
 
         // Using Git Serialization format, we should parse the blob as is (despite it looking like
@@ -980,7 +993,8 @@ mod tests {
         let entry = Entry::new(key.hgid, content.clone(), Metadata::default());
 
         let mut serialized = Vec::new();
-        entry.serialize(&mut serialized)?;
+        // Enable compression.
+        entry.serialize(&mut serialized, true)?;
 
         // Notice it is indeed compressed.
         assert_eq!(serialized, b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x145\x00\x00\x00ohello \x06\x00\x17Phello");
@@ -997,13 +1011,11 @@ mod tests {
         let key = key("a", "1");
         let content = Bytes::from_static(b"hello hello hello hello hello hello hello hello hello");
 
-        let mut entry = Entry::new(key.hgid, content.clone(), Metadata::default());
-
-        // Enable compression.
-        entry.should_compress = false;
+        let entry = Entry::new(key.hgid, content.clone(), Metadata::default());
 
         let mut serialized = Vec::new();
-        entry.serialize(&mut serialized)?;
+        // Disable compression.
+        entry.serialize(&mut serialized, false)?;
 
         // Notice it is indeed not compressed.
         assert_eq!(serialized, b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x01u\x00\x00\x00\x00\x00\x00\x005hello hello hello hello hello hello hello hello hello");

@@ -976,7 +976,11 @@ mod test {
         // Check that master points to a commit with the correct Hg hash.
         let master = repo
             .bookmarks()
-            .get(ctx.clone(), &BookmarkKey::new("master").unwrap())
+            .get(
+                ctx.clone(),
+                &BookmarkKey::new("master").unwrap(),
+                bookmarks::Freshness::MostRecent,
+            )
             .await
             .unwrap()
             .expect("master bookmark not found");

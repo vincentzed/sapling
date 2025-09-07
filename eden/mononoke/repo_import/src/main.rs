@@ -274,7 +274,7 @@ async fn find_mapping_version(
     let bookmark_val = large_to_small_syncer
         .get_large_repo()
         .bookmarks()
-        .get(ctx.clone(), dest_bookmark)
+        .get(ctx.clone(), dest_bookmark, bookmarks::Freshness::MostRecent)
         .await?
         .ok_or_else(|| format_err!("{} not found", dest_bookmark))?;
 
@@ -421,7 +421,10 @@ async fn move_bookmark(
         }
     };
 
-    let maybe_old_csid = repo.bookmarks().get(ctx.clone(), bookmark).await?;
+    let maybe_old_csid = repo
+        .bookmarks()
+        .get(ctx.clone(), bookmark, bookmarks::Freshness::MostRecent)
+        .await?;
 
     /* If the bookmark already exists, we should continue moving the
     bookmark from the last commit it points to */
@@ -504,7 +507,11 @@ async fn move_bookmark(
             let small_repo_cs_id = small_repo_back_sync_vars
                 .small_repo
                 .bookmarks()
-                .get(ctx.clone(), &small_repo_back_sync_vars.small_repo_bookmark)
+                .get(
+                    ctx.clone(),
+                    &small_repo_back_sync_vars.small_repo_bookmark,
+                    bookmarks::Freshness::MostRecent,
+                )
                 .await?
                 .ok_or_else(|| {
                     format_err!(
@@ -553,7 +560,11 @@ async fn merge_imported_commit(
         ctx.logger(),
         "Merging the imported commits into given bookmark, {}", dest_bookmark
     );
-    let master_cs_id = match repo.bookmarks().get(ctx.clone(), dest_bookmark).await? {
+    let master_cs_id = match repo
+        .bookmarks()
+        .get(ctx.clone(), dest_bookmark, bookmarks::Freshness::MostRecent)
+        .await?
+    {
         Some(id) => id,
         None => {
             return Err(format_err!(
@@ -1359,7 +1370,11 @@ async fn repo_import(
 
     let old_csid = repo
         .bookmarks()
-        .get(ctx.clone(), &repo_import_setting.importing_bookmark)
+        .get(
+            ctx.clone(),
+            &repo_import_setting.importing_bookmark,
+            bookmarks::Freshness::MostRecent,
+        )
         .await?
         .expect("The importing_bookmark should be set");
 
@@ -1503,7 +1518,7 @@ async fn check_megarepo_large_repo_import_requirements(
 ) -> Result<(), Error> {
     let dest_cs_id = repo
         .bookmarks()
-        .get(ctx.clone(), dest_bookmark)
+        .get(ctx.clone(), dest_bookmark, bookmarks::Freshness::MostRecent)
         .await?
         .ok_or_else(|| anyhow!("Bookmark not found: {}", dest_bookmark))?;
     if let Some(version) = repo

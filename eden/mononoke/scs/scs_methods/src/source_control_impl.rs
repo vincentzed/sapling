@@ -48,6 +48,7 @@ use futures_stats::TimedFutureExt;
 use futures_stats::TimedTryStreamExt;
 use futures_stats::TryStreamStats;
 use futures_watchdog::WatchdogExt;
+use git_source_of_truth::GitSourceOfTruthConfig;
 use identity::Identity;
 #[cfg(fbcode_build)]
 use lazy_static::lazy_static;
@@ -152,6 +153,8 @@ pub struct SourceControlServiceImpl {
     pub(crate) async_requests_queue: Option<Arc<AsyncMethodRequestQueue>>,
     identity_proxy_checker: Arc<ConnectionSecurityChecker>,
     pub(crate) acl_provider: Arc<dyn AclProvider>,
+    #[allow(unused)]
+    pub(crate) git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
     pub(crate) watchdog_max_poll: u64,
 }
 
@@ -171,6 +174,7 @@ impl SourceControlServiceImpl {
         common_config: &CommonConfig,
         factory_group: Option<Arc<FactoryGroup<2>>>,
         async_requests_queue: Option<Arc<AsyncMethodRequestQueue>>,
+        git_source_of_truth_config: Arc<dyn GitSourceOfTruthConfig>,
         watchdog_max_poll: u64,
     ) -> Result<Self, anyhow::Error> {
         scuba_builder.add_common_server_data();
@@ -191,6 +195,7 @@ impl SourceControlServiceImpl {
             factory_group,
             async_requests_queue,
             acl_provider: app.environment().acl_provider.clone(),
+            git_source_of_truth_config,
             watchdog_max_poll,
         })
     }
@@ -1083,11 +1088,11 @@ fn check_memory_usage(
 
 // Define a macro to construct a CoreContext based on the thrift parameters.
 macro_rules! create_ctx {
-    ( $service_impl:expr_2021, $method_name:ident, $req_ctxt:ident, $params_name:ident ) => {
+    ( $service_impl:expr, $method_name:ident, $req_ctxt:ident, $params_name:ident ) => {
         $service_impl.create_ctx(stringify!($method_name), $req_ctxt, None, &$params_name)
     };
 
-    ( $service_impl:expr_2021, $method_name:ident, $req_ctxt:ident, $obj_name:ident, $params_name:ident ) => {
+    ( $service_impl:expr, $method_name:ident, $req_ctxt:ident, $obj_name:ident, $params_name:ident ) => {
         $service_impl.create_ctx(
             stringify!($method_name),
             $req_ctxt,
@@ -1273,6 +1278,11 @@ impl SourceControlService for SourceControlServiceThriftImpl {
             commit: thrift::CommitSpecifier,
             params: thrift::CommitLookupParams,
         ) -> Result<thrift::CommitLookupResponse, service::CommitLookupExn>;
+
+        async fn repo_multiple_commit_lookup(
+            repo: thrift::RepoSpecifier,
+            params: thrift::RepoMultipleCommitLookupParams,
+        ) -> Result<thrift::RepoMultipleCommitLookupResponse, service::RepoMultipleCommitLookupExn>;
 
         async fn commit_lookup_pushrebase_history(
             commit: thrift::CommitSpecifier,

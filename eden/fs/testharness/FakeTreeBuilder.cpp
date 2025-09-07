@@ -118,9 +118,9 @@ void FakeTreeBuilder::setReady(RelativePathPiece path) {
   auto* parent = getStoredTree(path.dirname());
   const auto& entry = parent->get().find(path.basename())->second;
   if (entry.isTree()) {
-    store_->getStoredTree(entry.getHash())->setReady();
+    store_->getStoredTree(entry.getObjectId())->setReady();
   } else {
-    store_->getStoredBlob(entry.getHash())->setReady();
+    store_->getStoredBlob(entry.getObjectId())->setReady();
   }
 }
 
@@ -138,10 +138,10 @@ void FakeTreeBuilder::setAllReadyUnderTree(StoredTree* tree) {
   tree->setReady();
   for (const auto& entry : tree->get()) {
     if (entry.second.isTree()) {
-      auto* child = store_->getStoredTree(entry.second.getHash());
+      auto* child = store_->getStoredTree(entry.second.getObjectId());
       setAllReadyUnderTree(child);
     } else {
-      auto* child = store_->getStoredBlob(entry.second.getHash());
+      auto* child = store_->getStoredBlob(entry.second.getObjectId());
       child->setReady();
     }
   }
@@ -160,9 +160,9 @@ void FakeTreeBuilder::triggerError(
   auto* parent = getStoredTree(path.dirname());
   const auto& entry = parent->get().find(path.basename())->second;
   if (entry.isTree()) {
-    store_->getStoredTree(entry.getHash())->triggerError(std::move(ew));
+    store_->getStoredTree(entry.getObjectId())->triggerError(std::move(ew));
   } else {
-    store_->getStoredBlob(entry.getHash())->triggerError(std::move(ew));
+    store_->getStoredBlob(entry.getObjectId())->triggerError(std::move(ew));
   }
 }
 
@@ -235,7 +235,7 @@ StoredTree* FakeTreeBuilder::getStoredTree(RelativePathPiece path) {
           "tried to look up stored tree {} but {} is not a tree", path, name);
     }
 
-    current = store_->getStoredTree(entry.getHash());
+    current = store_->getStoredTree(entry.getObjectId());
   }
 
   return current;
@@ -249,7 +249,7 @@ StoredBlob* FakeTreeBuilder::getStoredBlob(RelativePathPiece path) {
         "tried to look up stored blob at {} but it is a tree rather than a blob",
         path);
   }
-  return store_->getStoredBlob(entry.getHash());
+  return store_->getStoredBlob(entry.getObjectId());
 }
 
 FakeTreeBuilder::EntryInfo::EntryInfo(TreeEntryType fileType) : type(fileType) {
@@ -277,15 +277,15 @@ StoredTree* FakeTreeBuilder::EntryInfo::finalizeTree(
   Tree::container treeEntries{kPathMapDefaultCaseSensitive};
   for (const auto& e : *entries) {
     const auto& entryInfo = e.second;
-    ObjectId hash;
+    ObjectId oid;
     if (entryInfo.type == TreeEntryType::TREE) {
       auto* storedTree = entryInfo.finalizeTree(builder, setReady);
-      hash = storedTree->get().getHash();
+      oid = storedTree->get().getObjectId();
     } else {
       auto [storedBlob, id] = entryInfo.finalizeBlob(builder, setReady);
-      hash = id;
+      oid = id;
     }
-    treeEntries.emplace(e.first, hash, entryInfo.type);
+    treeEntries.emplace(e.first, oid, entryInfo.type);
   }
 
   auto* storedTree = builder->store_->maybePutTree(treeEntries).first;
